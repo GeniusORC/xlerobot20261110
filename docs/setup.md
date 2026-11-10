@@ -160,11 +160,11 @@ wrong: using 0.25 m when the real value is 0.414 m makes a commanded turn about
 
 ### Direction inversion patch
 
-This build moves **backwards** when `x.vel` is positive, and the left/right
-wheel direction is globally reversed. The local XLeRobot clone is patched with
-`INVERT_WHEEL_DIRECTION = True` in
-`software/src/robots/xlerobot_2wheels/xlerobot_2wheels.py`, which flips both the
-wheel command and the feedback sign. Reproduce with:
+This build moves **backwards** when `x.vel` is positive. The initial global
+inversion fixed forward but also reversed the turn direction; the final patch
+inverts only the linear (x) component:
+`INVERT_LINEAR_DIRECTION = True` in
+`software/src/robots/xlerobot_2wheels/xlerobot_2wheels.py`. Reproduce with:
 
 ```bash
 ./scripts/apply_xlerobot_patches.sh
@@ -249,6 +249,13 @@ Verified on both environments (0.6.1 and 0.7.0), 0.03 m/s / 10 deg/s, 0.8 s per 
 | rotate left | -200 | -200 | left backward / right forward |
 | rotate right | +200 | +200 | left forward / right backward |
 
+Interactive field check after the final patch:
+
+```text
+FORWARD_OK
+LEFT_OK
+```
+
 After the direction-inversion patch, a positive `x.vel` should move forward.
 The raw signs above are from the patched build; confirm the physical direction
 on the floor before relying on teleop. After `stop_base()` the wheel velocities
@@ -277,11 +284,14 @@ Straight phase:
 
 Turn phase:
 
-- command: 20 deg/s for 4.5 s (expected 90 deg)
-- encoder wheel arc difference: **+0.5779 m**
-- measured actual rotation: **80 deg**
-- inferred wheelbase = 0.5779 / radians(80°) = **0.4139 m**
-- current value: **0.414 m**; confirm with a tape center-to-center measurement
+- first run: 20 deg/s for 4.5 s, wheel arc difference 0.5779 m;
+  measured actual rotation 80 deg → wheelbase **0.4139 m**
+- second run after the direction fix: 0.1 m/s for 5 s, encoder distance
+  magnitude **0.490 m** (target 0.5 m); 20 deg/s for 4.5 s, wheel arc
+  difference **0.6226 m**
+- if the second run actually turned 86.2 deg, the inferred wheelbase is 0.414 m
+- current value: **0.414 m**; measure the final actual angle on the floor to
+  confirm (0.6226 / radians(angle))
 
 Formula:
 

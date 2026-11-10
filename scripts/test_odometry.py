@@ -160,12 +160,12 @@ def main() -> int:
             right_rad = math.radians(acc["base_right_wheel"] * 360.0 / TICKS_PER_REV)
             wheel_avg = (left_rad + right_rad) / 2.0
             expected_d = args.speed * args.straight_time
-            enc_d = wheel_avg * args.wheel_radius
+            enc_d = abs(wheel_avg) * args.wheel_radius
             print(f"encoder wheel angle avg: {math.degrees(wheel_avg):.2f} deg")
             print(f"expected distance: {expected_d:.3f} m")
             print(f"encoder distance (r={args.wheel_radius}): {enc_d:.3f} m")
             if args.distance is not None:
-                r_actual = args.distance / wheel_avg if abs(wheel_avg) > 1e-6 else float("nan")
+                r_actual = args.distance / abs(wheel_avg) if abs(wheel_avg) > 1e-6 else float("nan")
                 print(f"measured distance: {args.distance:.3f} m")
                 print(f"inferred wheel radius: {r_actual:.4f} m (config {args.wheel_radius})")
             else:
@@ -194,7 +194,7 @@ def main() -> int:
             theta_actual = theta_imu
         left_rad2 = math.radians(-acc2["base_left_wheel"] * 360.0 / TICKS_PER_REV)
         right_rad2 = math.radians(acc2["base_right_wheel"] * 360.0 / TICKS_PER_REV)
-        wheel_diff = r_actual * (right_rad2 - left_rad2)
+        wheel_diff = r_actual * abs(right_rad2 - left_rad2)
         if abs(theta_actual) > 1e-4 and abs(wheel_diff) > 1e-6:
             L_actual = abs(wheel_diff / theta_actual)
             print(f"wheel arc difference: {wheel_diff:+.4f} m")
