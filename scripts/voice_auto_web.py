@@ -14,6 +14,7 @@ import argparse
 import difflib
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -36,9 +37,10 @@ FRAME = 512  # 32 ms
 
 app = Flask(__name__)
 
-MESSAGES = []
+CHAT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "chat")
+os.makedirs(CHAT_DIR, exist_ok=True)
+CHAT_DB = os.path.join(CHAT_DIR, "chat.db")
 MSG_LOCK = threading.Lock()
-NEXT_ID = 1
 LISTEN_ENABLED = threading.Event()
 LISTEN_ENABLED.set()
 LISTEN_PAUSED = threading.Event()
@@ -51,19 +53,45 @@ LAST_SPOKEN_AT = 0.0
 RECENT_SPOKEN = []  # (text, timestamp)
 
 
-def add_message(role, text):
-    global NEXT_ID
-    with MSG_LOCK:
-        m = {"id": NEXT_ID, "role": role, "text": text, "ts": time.time()}
-        NEXT_ID += 1
-        MESSAGES.append(m)
-        del MESSAGES[:-100]
-        return m
+def init_chat_db():
+    with sqlite3.connect(CHAT_DB) as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            text TEXT NOT NULL,
+            engine TEXT,
+            intent TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_id ON messages(id)")
+        db.commit()
 
 
-def get_messages(after=0):
-    with MSG_LOCK:
-        return [m for m in MESSAGES if m["id"] > after]
+def add_message(role, text, engine=None, intent=None):
+    with MSG_LOCK, sqlite3.connect(CHAT_DB) as db:
+        cur = db.execute(
+            "INSERT INTO messages(role,text,engine,intent,created_at) VALUES(?,?,?,?,?)",
+            (role, text, engine, intent, datetime.now().isoformat(timespec="seconds")),
+        )
+        db.commit()
+        return {"id": cur.lastrowid, "role": role, "text": text,
+                "engine": engine, "intent": intent}
+
+
+def get_messages(after=0, limit=200):
+    with sqlite3.connect(CHAT_DB) as db:
+        rows = db.execute(
+            "SELECT id,role,text,engine,intent,created_at FROM messages "
+            "WHERE id>? ORDER BY id ASC LIMIT ?", (after, limit)
+        ).fetchall()
+    return [{"id": r[0], "role": r[1], "text": r[2], "engine": r[3],
+             "intent": r[4], "created_at": r[5]} for r in rows]
+
+
+def message_count():
+    with sqlite3.connect(CHAT_DB) as db:
+        return db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
 
 
 def play_audio(name):
@@ -132,7 +160,7 @@ def process_text(text):
         LAST_SPOKEN = reply
         LAST_SPOKEN_AT = time.time()
         _remember_spoken(reply)
-        add_message("bot", reply)
+        add_message("bot", reply, engine=out.get("engine"), intent=out.get("intent"))
         play_audio(out.get("audio"))
     return out
 
@@ -249,7 +277,7 @@ def api_command():
     add_message("user", f"[按钮] {intent}")
     if out.get("reply"):
         _remember_spoken(out["reply"])
-        add_message("bot", out["reply"])
+        add_message("bot", out["reply"], engine="local", intent=intent)
         play_audio(out.get("audio"))
     return jsonify(out)
 
@@ -404,7 +432,9 @@ def main():
     PLAYBACK_DEV = args.playback_dev
 
     vw.load_models()
-    add_message("bot", "您好，我是小乐，您的居家陪伴机器人。今天感觉怎么样？")
+    init_chat_db()
+    if message_count() == 0:
+        add_message("bot", "您好，我是小乐，您的居家陪伴机器人。今天感觉怎么样？")
     print(f"auto voice web on http://{args.host}:{args.port}", flush=True)
     print("LLM configured:", bool(os.environ.get("LLM_BASE_URL") and os.environ.get("LLM_MODEL")), flush=True)
     if not args.no_listen:

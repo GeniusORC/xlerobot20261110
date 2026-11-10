@@ -518,3 +518,27 @@ not visible, the session reports “数据不足” instead of inventing gait nu
 The report is a 2D RGB screening aid, not a medical diagnosis. Persistent pain,
 dizziness, chest tightness or sudden instability should be evaluated by a
 clinician.
+
+## 17. Chat database
+
+The always-on voice/chat agent persists every message to SQLite:
+
+```text
+data/chat/chat.db
+```
+
+Table `messages`:
+
+| column | meaning |
+|---|---|
+| id | message id |
+| role | user / bot / sys |
+| text | message text |
+| engine | `llm` (DeepSeek), `fallback`, `safety`, `local` |
+| intent | command intent, or `chat` |
+| created_at | ISO timestamp |
+
+`/api/messages?after=<id>` reads from the DB, so the page restores history after
+a restart. The initial greeting is only inserted when the database is empty.
+Verified with DeepSeek: the user message and the `engine: "llm"` reply were
+written, and both reappeared after restarting the service.
