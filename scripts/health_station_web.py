@@ -9,6 +9,7 @@ The camera source defaults to the head stream from camera_web:
 http://127.0.0.1:8080/snapshot/head
 """
 import argparse
+import glob
 import json
 import os
 import threading
@@ -290,6 +291,29 @@ def run_capture(source, duration, fps):
             STATE.update(running=False, progress=1.0, error=f"{type(e).__name__}: {e}")
 
 
+def load_latest_result():
+    """Show the most recent saved result when the page opens."""
+    files = sorted(glob.glob(os.path.join(HEALTH_DIR, "metrics_*.json")))
+    if not files:
+        return
+    json_path = files[-1]
+    ts = os.path.basename(json_path)[len("metrics_"):-len(".json")]
+    try:
+        with open(json_path, encoding="utf-8") as f:
+            metrics = json.load(f)
+    except Exception:
+        return
+    pose = f"pose_{ts}.png"
+    gait = f"gait_{ts}.png"
+    STATE["latest"] = {
+        "ts": ts,
+        "metrics": metrics,
+        "pose": pose if os.path.exists(os.path.join(HEALTH_DIR, pose)) else None,
+        "gait": gait if os.path.exists(os.path.join(HEALTH_DIR, gait)) else None,
+        "json": os.path.basename(json_path),
+    }
+
+
 def stop_robot():
     try:
         requests.post(f"{ROBOT_API}/command", json={"intent": "stop"}, timeout=5)
@@ -438,6 +462,7 @@ def main():
     args = ap.parse_args()
     STATE["source"] = args.source
     STATE["duration"] = args.duration
+    load_latest_result()
     LANDMARKER = make_landmarker()
     print(f"health station on http://{args.host}:{args.port}", flush=True)
     print(f"source: {args.source}", flush=True)
