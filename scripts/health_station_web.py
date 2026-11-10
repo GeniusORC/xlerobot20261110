@@ -12,6 +12,7 @@ import argparse
 import glob
 import json
 import os
+import sqlite3
 import threading
 import time
 import traceback
@@ -33,6 +34,7 @@ import matplotlib.pyplot as plt
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HEALTH_DIR = os.path.join(ROOT, "data", "health")
 os.makedirs(HEALTH_DIR, exist_ok=True)
+DB_PATH = os.path.join(HEALTH_DIR, "health.db")
 MODEL = os.path.join(ROOT, "models", "pose_landmarker_lite.task")
 ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090")
 DEFAULT_SOURCE = "http://127.0.0.1:8080/snapshot/head"
@@ -129,6 +131,12 @@ def extract(lms, w, h):
     need = ("LS", "RS", "LH", "RH", "LK", "RK", "LA", "RA")
     if any(p[k] is None for k in need):
         return None
+    # Reject partial bodies: head/torso close-ups often produce hallucinated
+    # leg landmarks outside the frame, which would create fake gait numbers.
+    for k in need:
+        lm = lms[idx[k]]
+        if not (0.01 < lm.x < 0.99 and 0.01 < lm.y < 0.99):
+            return None
     shoulder_w = float(np.linalg.norm(p["LS"] - p["RS"]))
     if shoulder_w < 15:
         return None
@@ -276,12 +284,22 @@ def run_capture(source, duration, fps):
         plot_gait(series, fps, gait_path)
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, ensure_ascii=False, indent=2)
+        report, tips, risk = make_report(metrics)
+        pose_name = os.path.basename(pose_path) if os.path.exists(pose_path) else None
+        gait_name = os.path.basename(gait_path)
+        json_name = os.path.basename(json_path)
+        session_id = save_session(ts, metrics, report, tips, risk,
+                                  pose_name, gait_name, json_name)
         latest = {
+            "session_id": session_id,
             "ts": ts,
             "metrics": metrics,
-            "pose": os.path.basename(pose_path) if os.path.exists(pose_path) else None,
-            "gait": os.path.basename(gait_path),
-            "json": os.path.basename(json_path),
+            "report": report,
+            "tips": tips,
+            "risk": risk,
+            "pose": pose_name,
+            "gait": gait_name,
+            "json": json_name,
         }
         with LOCK:
             STATE.update(running=False, progress=1.0, latest=latest, error=None)
@@ -292,7 +310,17 @@ def run_capture(source, duration, fps):
 
 
 def load_latest_result():
-    """Show the most recent saved result when the page opens."""
+    """Load the newest database session; migrate the newest file if needed."""
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+        if row is not None:
+            STATE["latest"] = row_to_latest(row)
+            return
+    except Exception as e:
+        print("DB load failed:", e, flush=True)
+
     files = sorted(glob.glob(os.path.join(HEALTH_DIR, "metrics_*.json")))
     if not files:
         return
@@ -303,14 +331,155 @@ def load_latest_result():
             metrics = json.load(f)
     except Exception:
         return
+    report, tips, risk = make_report(metrics)
     pose = f"pose_{ts}.png"
     gait = f"gait_{ts}.png"
+    pose = pose if os.path.exists(os.path.join(HEALTH_DIR, pose)) else None
+    gait = gait if os.path.exists(os.path.join(HEALTH_DIR, gait)) else None
+    sid = save_session(ts, metrics, report, tips, risk, pose, gait,
+                       os.path.basename(json_path))
     STATE["latest"] = {
+        "session_id": sid,
         "ts": ts,
         "metrics": metrics,
-        "pose": pose if os.path.exists(os.path.join(HEALTH_DIR, pose)) else None,
-        "gait": gait if os.path.exists(os.path.join(HEALTH_DIR, gait)) else None,
+        "report": report,
+        "tips": tips,
+        "risk": risk,
+        "pose": pose,
+        "gait": gait,
         "json": os.path.basename(json_path),
+    }
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT UNIQUE,
+            duration REAL,
+            frames INTEGER,
+            step_count INTEGER,
+            cadence REAL,
+            symmetry REAL,
+            risk TEXT,
+            metrics TEXT,
+            report TEXT,
+            tips TEXT,
+            pose TEXT,
+            gait TEXT,
+            json TEXT,
+            created_at TEXT
+        )
+        """)
+        db.commit()
+
+
+def make_report(m):
+    """Rule-based report and health tips. Not a medical diagnosis."""
+    steps = int(m.get("step_count", 0) or 0)
+    dur = float(m.get("duration_s", 0) or 0)
+    cad = float(m.get("cadence_spm", 0) or 0)
+    sym = float(m.get("knee_symmetry_pct", 0) or 0)
+    kr = (float(m.get("knee_left_range_deg", 0) or 0) +
+          float(m.get("knee_right_range_deg", 0) or 0)) / 2
+    tm = float(m.get("trunk_mean_deg", 0) or 0)
+    ts = float(m.get("trunk_std_deg", 0) or 0)
+    sway = float(m.get("sway_norm", 0) or 0)
+    step_norm = float(m.get("step_length_norm", 0) or 0)
+
+    if steps < 2 or dur < 2.5:
+        report = (
+            "本次采集没有形成连续步行，可能是站立、转身或人体未完整入镜。"
+            "这组数据不能用于步态风险判断，建议让老人自然走 5–10 步后重新采集。"
+        )
+        tips = [
+            "请站在距机器人 2–3 米处，保证头、髋、膝、踝都在画面内。",
+            "采集时自然连续走 5–10 步，不要只站着或转身。",
+            "如老人行动不便，请家人在旁保护，必要时使用助行器。",
+        ]
+        return report, tips, "数据不足"
+
+    findings = []
+    if cad < 60:
+        findings.append("步频偏慢")
+    elif cad > 120:
+        findings.append("步频偏快")
+    if sym > 15:
+        findings.append("左右膝活动存在明显不对称")
+    if kr < 10:
+        findings.append("膝关节活动范围偏小")
+    elif kr > 55:
+        findings.append("膝关节活动幅度偏大")
+    if abs(tm) > 10:
+        findings.append("躯干前倾/侧倾较明显")
+    if ts > 5:
+        findings.append("躯干左右摆动较大")
+    if sway > 0.08:
+        findings.append("重心左右摆动偏大")
+    if step_norm < 0.8:
+        findings.append("步幅偏小")
+
+    if not findings:
+        risk = "低"
+        summary = "步态节律和左右对称性基本正常，未发现明显异常。"
+    elif len(findings) <= 2:
+        risk = "中"
+        summary = "发现 " + "、".join(findings) + "，建议关注并定期复测。"
+    else:
+        risk = "高"
+        summary = "发现 " + "、".join(findings) + "，建议尽快由家人陪同评估。"
+
+    report = (
+        f"本次有效采集 {dur:.1f} 秒、{steps} 步，步频约 {cad:.0f} 步/分；"
+        f"左右膝平均活动范围约 {kr:.1f}°，膝对称性偏差 {sym:.1f}%。\n"
+        f"观察结果：{summary}\n"
+        "说明：这是基于 RGB 2D 姿态的筛查结果，不是医学诊断。"
+    )
+    tips = []
+    if cad < 60:
+        tips.append("每天分次慢走 10–20 分钟，先热身，量力而行。")
+    if sym > 15 or abs(tm) > 10 or sway > 0.08:
+        tips.append("可做扶墙单腿站立、重心转移等平衡练习，旁边一定要有人保护。")
+    if kr < 10:
+        tips.append("做温和的膝关节屈伸和股四头肌拉伸，避免久坐后突然起身。")
+    if step_norm < 0.8:
+        tips.append("步幅不要刻意迈大，先求稳，再逐步增加步幅。")
+    tips.append("如出现膝髋疼痛、头晕、胸闷或走路突然不稳，请及时就医。")
+    tips.append("建议每周在相同位置复测一次，观察趋势而不是单次结果。")
+    return report, tips, risk
+
+
+def save_session(ts, metrics, report, tips, risk, pose, gait, json_name):
+    with sqlite3.connect(DB_PATH) as db:
+        cur = db.execute(
+            """INSERT OR REPLACE INTO sessions
+               (ts, duration, frames, step_count, cadence, symmetry, risk,
+                metrics, report, tips, pose, gait, json, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, metrics.get("duration_s"), metrics.get("frames"),
+             metrics.get("step_count"), metrics.get("cadence_spm"),
+             metrics.get("knee_symmetry_pct"), risk,
+             json.dumps(metrics, ensure_ascii=False),
+             report, json.dumps(tips, ensure_ascii=False),
+             pose, gait, json_name, datetime.now().isoformat(timespec="seconds")),
+        )
+        db.commit()
+        return cur.lastrowid
+
+
+def row_to_latest(row):
+    d = dict(row)
+    return {
+        "session_id": d["id"],
+        "ts": d["ts"],
+        "metrics": json.loads(d["metrics"]),
+        "report": d["report"],
+        "tips": json.loads(d["tips"]),
+        "risk": d["risk"],
+        "pose": d["pose"],
+        "gait": d["gait"],
+        "json": d["json"],
     }
 
 
@@ -353,6 +522,24 @@ def stop():
     return jsonify({"ok": True})
 
 
+@app.get("/api/history")
+def api_history():
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute("SELECT * FROM sessions ORDER BY id DESC LIMIT 12").fetchall()
+    return jsonify({"sessions": [row_to_latest(r) for r in rows]})
+
+
+@app.get("/api/session/<int:sid>")
+def api_session(sid):
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+    if row is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"latest": row_to_latest(row)})
+
+
 @app.get("/api/status")
 def status():
     with LOCK:
@@ -382,6 +569,13 @@ td{padding:5px;border-bottom:1px solid #333}
 td:first-child{color:#aaa;width:55%}
 #msg{font-size:13px;color:#9c9}
 small{color:#888}
+h3{margin:14px 0 6px;font-size:15px;color:#ddd}
+#risk{font-size:14px;margin-bottom:6px}
+#report{font-size:13px;line-height:1.6;white-space:pre-wrap;color:#ddd;background:#151517;border-radius:8px;padding:10px}
+#tips{margin:6px 0 0 18px;padding:0;font-size:13px;line-height:1.6;color:#ccc}
+#tips li{margin:3px 0}
+.hist td{font-size:12px}
+.hist button{font-size:12px;padding:5px 8px;margin:0}
 </style></head><body>
 <h1>固定健康站 <small>· 机器人停稳 + RGB + MediaPipe</small></h1>
 <div class="grid">
@@ -404,6 +598,11 @@ small{color:#888}
       <tr><td>步长（归一化）</td><td id="m_step">-</td></tr>
       <tr><td>重心摆动（归一化）</td><td id="m_sway">-</td></tr>
     </table>
+    <h3>健康报告</h3>
+    <div id="risk">风险等级：-</div>
+    <div id="report">还没有报告。</div>
+    <h3>健康建议</h3>
+    <ul id="tips"><li>采集后自动生成。</li></ul>
   </div>
   <div class="card">
     <strong>采集结果</strong>
@@ -411,6 +610,10 @@ small{color:#888}
     <img id="pose" style="display:none">
     <img id="gait" style="display:none">
   </div>
+</div>
+<div class="card" style="margin-top:16px">
+  <h3 style="margin-top:0">历史记录（已保存到 SQLite）</h3>
+  <table class="hist"><thead><tr><td>时间</td><td>风险</td><td>步数</td><td>步频</td><td>对称性</td><td></td></tr></thead><tbody id="history"></tbody></table>
 </div>
 <script>
 async function prepare(){
@@ -424,30 +627,57 @@ async function startCapture(){
 }
 async function stopCapture(){ await fetch('/api/stop',{method:'POST'}); }
 function set(id,v){ document.getElementById(id).textContent=v; }
+let lastSession=null;
+function renderLatest(l){
+  if(!l || !l.metrics) return;
+  const m=l.metrics;
+  set('m_status','完成 '+l.ts);
+  set('m_steps',m.step_count);
+  set('m_cadence',m.cadence_spm);
+  set('m_knee',m.knee_left_mean_deg+' / '+m.knee_right_mean_deg+' °');
+  set('m_krange',m.knee_left_range_deg+' / '+m.knee_right_range_deg+' °');
+  set('m_trunk',m.trunk_mean_deg+' / '+m.trunk_std_deg+' °');
+  set('m_sym',m.knee_symmetry_pct+' %');
+  set('m_step',m.step_length_norm);
+  set('m_sway',m.sway_norm);
+  if(l.risk) document.getElementById('risk').textContent='风险等级：'+l.risk;
+  if(l.report) document.getElementById('report').textContent=l.report;
+  if(l.tips){
+    const ul=document.getElementById('tips'); ul.innerHTML='';
+    for(const t of l.tips){ const li=document.createElement('li'); li.textContent=t; ul.appendChild(li); }
+  }
+  if(l.pose){ const p=document.getElementById('pose'); p.src='/files/'+l.pose+'?t='+Date.now(); p.style.display='block'; }
+  if(l.gait){ const g=document.getElementById('gait'); g.src='/files/'+l.gait+'?t='+Date.now(); g.style.display='block'; }
+  document.getElementById('results').innerHTML='<small>session: '+l.session_id+'<br>pose: '+l.pose+'<br>gait: '+l.gait+'<br>json: '+l.json+'</small>';
+  if(l.session_id!==lastSession){ lastSession=l.session_id; loadHistory(); }
+}
+async function loadHistory(){
+  try{
+    const r=await fetch('/api/history'); const j=await r.json();
+    const tb=document.getElementById('history'); tb.innerHTML='';
+    for(const s of j.sessions){
+      const tr=document.createElement('tr');
+      tr.innerHTML='<td>'+s.ts+'</td><td>'+s.risk+'</td><td>'+s.metrics.step_count+'</td><td>'+s.metrics.cadence_spm+'</td><td>'+s.metrics.knee_symmetry_pct+'%</td><td><button onclick="loadSession('+s.session_id+')">查看</button></td>';
+      tb.appendChild(tr);
+    }
+  }catch(e){}
+}
+async function loadSession(id){
+  try{
+    const r=await fetch('/api/session/'+id); const j=await r.json();
+    if(j.latest) renderLatest(j.latest);
+  }catch(e){}
+}
 async function poll(){
   try{
     const r=await fetch('/api/status'); const j=await r.json();
     document.getElementById('fill').style.width=Math.round((j.progress||0)*100)+'%';
     if(j.error) document.getElementById('msg').textContent=j.error;
-    if(j.latest && j.latest.metrics){
-      const m=j.latest.metrics;
-      set('m_status','完成 '+j.latest.ts);
-      set('m_steps',m.step_count);
-      set('m_cadence',m.cadence_spm);
-      set('m_knee',m.knee_left_mean_deg+' / '+m.knee_right_mean_deg+' °');
-      set('m_krange',m.knee_left_range_deg+' / '+m.knee_right_range_deg+' °');
-      set('m_trunk',m.trunk_mean_deg+' / '+m.trunk_std_deg+' °');
-      set('m_sym',m.knee_symmetry_pct+' %');
-      set('m_step',m.step_length_norm);
-      set('m_sway',m.sway_norm);
-      if(j.latest.pose){ const p=document.getElementById('pose'); p.src='/files/'+j.latest.pose+'?t='+Date.now(); p.style.display='block'; }
-      if(j.latest.gait){ const g=document.getElementById('gait'); g.src='/files/'+j.latest.gait+'?t='+Date.now(); g.style.display='block'; }
-      document.getElementById('results').innerHTML='<small>pose: '+j.latest.pose+'<br>gait: '+j.latest.gait+'<br>json: '+j.latest.json+'</small>';
-    }
+    if(j.latest) renderLatest(j.latest);
     if(j.running) setTimeout(poll,700);
   }catch(e){}
 }
-poll();
+poll(); loadHistory();
 </script></body></html>
 """
 
@@ -462,6 +692,7 @@ def main():
     args = ap.parse_args()
     STATE["source"] = args.source
     STATE["duration"] = args.duration
+    init_db()
     load_latest_result()
     LANDMARKER = make_landmarker()
     print(f"health station on http://{args.host}:{args.port}", flush=True)

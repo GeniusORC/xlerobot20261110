@@ -494,3 +494,27 @@ For local use, put them in a git-ignored, user-only file:
 Verified with DeepSeek `deepseek-chat`: `/api/chat` returned `engine: "llm"` and
 a natural reply, then TTS spoke it. Without the variables it falls back to the
 local rule-based companion.
+
+## 16. Health report, tips and SQLite history
+
+After each capture the health station now:
+
+1. generates a Chinese screening report from the metrics;
+2. generates 3–5 health tips;
+3. assigns a risk level (`低` / `中` / `高` / `数据不足`);
+4. saves everything to `data/health/health.db` (SQLite).
+
+Database table `sessions` stores: timestamp, duration, frames, steps, cadence,
+symmetry, risk, full metrics JSON, report text, tips JSON, pose/gait/json paths
+and `created_at`.
+
+The web page at 8084 shows the report, tips, risk level and a history table
+(`/api/history`, `/api/session/<id>`); the newest DB row is loaded on startup.
+
+Important: a partial-body close-up can make MediaPipe hallucinate leg landmarks.
+`extract()` now rejects landmarks outside the image bounds; if the full body is
+not visible, the session reports “数据不足” instead of inventing gait numbers.
+
+The report is a 2D RGB screening aid, not a medical diagnosis. Persistent pain,
+dizziness, chest tightness or sudden instability should be evaluated by a
+clinician.
