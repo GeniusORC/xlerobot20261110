@@ -41,8 +41,13 @@ ros2 launch realsense2_camera rs_launch.py \
 ## Known issues
 
 - The XLeRobot config defaults to `wheel_radius=0.05`; the 5-inch wheel radius is
-  **0.0635 m**. The IKEA RÅSKOG build has an estimated **0.367 m** wheelbase
-  (cart width 0.35 m + mounts); measure center-to-center to confirm.
+  **0.0635 m**. The measured turn test gives a **0.414 m** wheelbase for the
+  IKEA RÅSKOG build; measure center-to-center to confirm.
+- This build drives backwards for positive `x.vel`. The local clone is patched
+  with `INVERT_WHEEL_DIRECTION = True`; re-apply with
+  `./scripts/apply_xlerobot_patches.sh`.
+- D455 is temporarily unused. The head RGB camera is `/dev/video6`; wrist
+  cameras are `/dev/video0` and `/dev/video2`.
 - Motor-bus mapping (1 Mbaud):
   - `/dev/xlerobot_serial_b` → IDs 1–8 → **bus1** (left arm + head), use as `port1`
   - `/dev/xlerobot_serial_a` → IDs 1–6, 9, 10 → **bus2** (right arm + 2 wheels), use as `port2`

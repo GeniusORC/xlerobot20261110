@@ -1,0 +1,36 @@
+--- a/software/src/robots/xlerobot_2wheels/xlerobot_2wheels.py
++++ b/software/src/robots/xlerobot_2wheels/xlerobot_2wheels.py
+@@ -36,6 +36,11 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Local robot-specific fix: both drive wheels are physically reversed on this
++# build, so a positive x.vel currently moves the cart backwards. Flip both the
++# command and the feedback signs to keep teleop/odometry consistent.
++INVERT_WHEEL_DIRECTION = True
++
+ 
+ class XLerobot2Wheels(Robot):
+     """
+@@ -392,6 +397,10 @@
+           - Differential drive kinematics: only x and theta are controllable
+           - y velocity is ignored (differential drive cannot move sideways)
+         """
++        if INVERT_WHEEL_DIRECTION:
++            x = -x
++            theta = -theta
++
+         if wheel_radius is None:
+             wheel_radius = self.config.wheel_radius
+         if wheelbase is None:
+@@ -476,6 +485,10 @@
+         x_vel = (left_linear_speed + right_linear_speed) / 2
+         theta_rad = (right_linear_speed - left_linear_speed) / wheelbase
+         theta_vel = theta_rad * (180.0 / np.pi)
++
++        if INVERT_WHEEL_DIRECTION:
++            x_vel = -x_vel
++            theta_vel = -theta_vel
+         
+         return {
+             "x.vel": x_vel,

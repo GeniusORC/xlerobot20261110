@@ -135,29 +135,42 @@ wheelbase: float = 0.25
 For the 5-inch wheels, set `wheel_radius=0.0635` (measured value preferred).
 The upstream default `wheelbase=0.25` is too small for the IKEA RÅSKOG build.
 
-### Estimated wheelbase from the cart/CAD
+### Wheelbase (measured by the 80° turn test)
 
-The RÅSKOG cart is 350 mm wide. The 0.4.0 dual-wheel base assembly
-(`XLeRobot040_dualwheelbase.step`) spans 367 mm laterally, with the wheel
-mounts at the two sides. A reasonable starting value is therefore:
+The RÅSKOG cart is 350 mm wide and the CAD base spans 367 mm, so 0.367 m was
+the initial estimate. The first on-ground turn test then commanded 90° but the
+robot actually turned **80°**, which gives:
 
 ```text
-wheelbase ≈ 0.367 m  (367 mm); expected range 0.36–0.40 m
+L = 0.5779 m (wheel arc difference) / radians(80°) = 0.4139 m
 ```
 
-This is an estimate from the cart width and base CAD, not a substitute for a
-tape measurement. Measure the **center-to-center** distance between the two
-drive wheels and update the value if it differs.
+Use **0.414 m** as the current value (expect 0.41–0.42 m). Measure the
+center-to-center distance with a tape to confirm; update if needed.
 
 Example override when running a LeRobot CLI:
 
 ```bash
---robot.wheel_radius=0.0635 --robot.wheelbase=0.367
+--robot.wheel_radius=0.0635 --robot.wheelbase=0.414
 ```
 
-With the wrong wheelbase, straight motion is mostly unaffected but turns are:
-using 0.25 m when the real value is 0.367 m makes a commanded turn roughly
-32% smaller than requested.
+With the wrong wheelbase, straight motion is mostly unaffected but turns are
+wrong: using 0.25 m when the real value is 0.414 m makes a commanded turn about
+40% smaller than requested.
+
+### Direction inversion patch
+
+This build moves **backwards** when `x.vel` is positive, and the left/right
+wheel direction is globally reversed. The local XLeRobot clone is patched with
+`INVERT_WHEEL_DIRECTION = True` in
+`software/src/robots/xlerobot_2wheels/xlerobot_2wheels.py`, which flips both the
+wheel command and the feedback sign. Reproduce with:
+
+```bash
+./scripts/apply_xlerobot_patches.sh
+```
+
+Patch file: `patches/0001-invert-wheel-direction.patch`.
 
 ### Verified motor mapping (1 Mbaud)
 
@@ -231,17 +244,16 @@ Verified on both environments (0.6.1 and 0.7.0), 0.03 m/s / 10 deg/s, 0.8 s per 
 
 | Command | Left raw | Right raw | Result |
 |---|---:|---:|---|
-| forward | -300 | +300 | both wheels forward |
-| reverse | +300 | -300 | both wheels backward |
-| rotate left | +200 | +200 | left backward / right forward |
-| rotate right | -200 | -200 | left forward / right backward |
+| forward | +300 | -300 | both wheels forward (after patch) |
+| reverse | -300 | +300 | both wheels backward (after patch) |
+| rotate left | -200 | -200 | left backward / right forward |
+| rotate right | +200 | +200 | left forward / right backward |
 
-The left motor is mounted mirrored, so its raw sign is inverted in the code.
-After `stop_base()` the wheel velocities return to 0 within about 0.4 s.
-0.6.1 and 0.7.0 produce the same commands and comparable feedback.
-
-Next: measure the wheelbase, then run a 1 m straight-line odometry test on the
-ground and a 90° turn test.
+After the direction-inversion patch, a positive `x.vel` should move forward.
+The raw signs above are from the patched build; confirm the physical direction
+on the floor before relying on teleop. After `stop_base()` the wheel velocities
+return to 0 within about 0.4 s. 0.6.1 and 0.7.0 produce the same commands and
+comparable feedback.
 
 ## 8. Next steps
 
@@ -250,7 +262,7 @@ ground and a 90° turn test.
 3. Add a USB mic array/speaker; test 1–3 m ASR with servo noise.
 4. Map the lab with RTAB-Map/Nav2.
 
-## 8. Odometry test (preliminary, 2026-11-10)
+## 8. Odometry test (2026-11-10)
 
 Script: `scripts/test_odometry.py`
 
@@ -259,20 +271,32 @@ Straight phase:
 - command: 0.15 m/s for 6.7 s (expected 1.005 m)
 - encoder wheel angle: 893.85 deg average
 - encoder distance with r=0.0635 m: **0.991 m**
-- actual tape measurement still needed to refine the wheel radius
+- the robot went straight, but the direction was reversed; fixed by the
+  direction-inversion patch above
+- tape measurement still needed to refine the wheel radius
 
 Turn phase:
 
 - command: 20 deg/s for 4.5 s (expected 90 deg)
 - encoder wheel arc difference: **+0.5779 m**
-- D455 was not connected, so the IMU could not measure the actual body angle
-- if the actual turn is 90 deg, inferred wheelbase = 0.5779 / (pi/2) = **0.368 m**,
-  consistent with the 0.367 m CAD/cart estimate
-- to confirm independently, reconnect the D455 (gyro) or measure the actual
-  rotation angle with a phone/protractor and rerun with `--angle <deg>`
+- measured actual rotation: **80 deg**
+- inferred wheelbase = 0.5779 / radians(80°) = **0.4139 m**
+- current value: **0.414 m**; confirm with a tape center-to-center measurement
 
-Formula used:
+Formula:
 
 ```text
 L_actual = wheel_arc_difference / actual_body_angle_rad
 ```
+
+### Camera note
+
+The D455 is not used for now. The robot has three USB RGB cameras:
+
+- `/dev/video0`, `/dev/video2`: wrist views
+- `/dev/video6`: head view (arms/cart visible from above)
+- `/dev/video8`: laptop webcam
+
+For the temporary RGB-only setup, use `/dev/video6` as the head camera. Without
+D455 depth/IMU, navigation and gait work must use monocular vision and wheel
+odometry; the 90° test angle must come from a floor/phone measurement.

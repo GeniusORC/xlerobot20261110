@@ -120,7 +120,7 @@ def main() -> int:
     ap.add_argument("--turn-rate", type=float, default=20.0)
     ap.add_argument("--turn-time", type=float, default=4.5)
     ap.add_argument("--wheel-radius", type=float, default=0.0635)
-    ap.add_argument("--wheelbase", type=float, default=0.367)
+    ap.add_argument("--wheelbase", type=float, default=0.414)
     ap.add_argument("--distance", type=float, default=None, help="measured straight distance in m")
     ap.add_argument("--angle", type=float, default=None, help="measured turn angle in deg (if no IMU)")
     ap.add_argument("--skip-straight", action="store_true")

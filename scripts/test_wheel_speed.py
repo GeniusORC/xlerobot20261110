@@ -28,7 +28,7 @@ def main() -> int:
     ap.add_argument("--port1", default="/dev/xlerobot_serial_b")
     ap.add_argument("--port2", default="/dev/xlerobot_serial_a")
     ap.add_argument("--wheel-radius", type=float, default=0.0635)
-    ap.add_argument("--wheelbase", type=float, default=0.367)
+    ap.add_argument("--wheelbase", type=float, default=0.414)
     args = ap.parse_args()
 
     cfg = XLerobot2WheelsConfig(
