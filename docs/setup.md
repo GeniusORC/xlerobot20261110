@@ -375,3 +375,24 @@ q or Esc   quit
 
 The script holds the current arm pose and commands only the base. It stops the
 base on every idle loop and disconnects in `finally`.
+
+## 11. Voice/chat commands
+
+The web demo (`scripts/voice_web.py`, port 8082) routes these commands to the
+robot, and everything else to the companion chat:
+
+| Intent | Example phrases | Action |
+|---|---|---|
+| `stop` | 停下、停止、别动 | stop base |
+| `come` | 过来、靠近 | forward 0.2 m (stub) |
+| `forward` | 前进、往前 | forward 0.2 m |
+| `backward` | 后退、往后 | backward 0.2 m |
+| `turn_left` | 左转、向左转 | rotate ~90° |
+| `turn_right` | 右转、向右转 | rotate ~90° |
+| `look` | 看我、看着我、面向我 | face detection + base turn to center |
+| `report` | 报告、状态 | return robot status |
+
+All motion commands are 0.05 m/s / 20 deg/s, stop on timeout, and can be
+preempted by “停下”. The `look` command fetches `/snapshot/head` from the camera
+server and rotates the base until the largest detected face is centered; if no
+face is found it reports “没有看到您的脸”.

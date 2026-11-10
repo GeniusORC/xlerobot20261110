@@ -82,6 +82,16 @@ def map_intent(text: str) -> str:
     t = (text or "").lower()
     if any(k in t for k in ("停下", "停止", "停住", "别动", "不要动")):
         return "stop"
+    if any(k in t for k in ("看我", "看着我", "面向我", "转过来", "看看我")):
+        return "look"
+    if any(k in t for k in ("左转", "向左转", "往左转")):
+        return "turn_left"
+    if any(k in t for k in ("右转", "向右转", "往右转")):
+        return "turn_right"
+    if any(k in t for k in ("前进", "向前", "往前", "往前走", "走一点")):
+        return "forward"
+    if any(k in t for k in ("后退", "向后", "往后", "退一点", "退后")):
+        return "backward"
     if any(k in t for k in ("过来", "到这里", "来一下", "过来一下", "靠近")):
         return "come"
     if any(k in t for k in ("报告", "汇报", "状态", "情况", "报一下")):
@@ -235,6 +245,31 @@ def handle_intent(intent: str, text: str = "") -> dict:
             reply = "机器人未连接，请检查串口和电源。"
         return {"text": text, "intent": intent, "reply": reply,
                 "robot": result, "status": status, "audio": speech_file(reply)}
+    if intent == "forward":
+        result = robot_command("forward")
+        reply = "好的，向前一点。"
+        return {"text": text, "intent": intent, "reply": reply, "robot": result,
+                "audio": speech_file(reply)}
+    if intent == "backward":
+        result = robot_command("backward")
+        reply = "好的，向后退一点。"
+        return {"text": text, "intent": intent, "reply": reply, "robot": result,
+                "audio": speech_file(reply)}
+    if intent == "turn_left":
+        result = robot_command("turn_left")
+        reply = "好的，向左转。"
+        return {"text": text, "intent": intent, "reply": reply, "robot": result,
+                "audio": speech_file(reply)}
+    if intent == "turn_right":
+        result = robot_command("turn_right")
+        reply = "好的，向右转。"
+        return {"text": text, "intent": intent, "reply": reply, "robot": result,
+                "audio": speech_file(reply)}
+    if intent == "look":
+        result = robot_command("look")
+        reply = "好的，我看着您。"
+        return {"text": text, "intent": intent, "reply": reply, "robot": result,
+                "audio": speech_file(reply)}
     return {"text": text, "intent": intent, "reply": "未知意图"}
 
 
@@ -265,7 +300,7 @@ def api_chat():
 def api_command():
     data = request.get_json(force=True, silent=True) or {}
     intent = str(data.get("intent", "")).strip().lower()
-    if intent not in ("stop", "come", "report"):
+    if intent not in ("stop", "come", "report", "forward", "backward", "turn_left", "turn_right", "look"):
         return jsonify({"error": "intent must be stop|come|report"}), 400
     return jsonify(handle_intent(intent))
 
@@ -338,9 +373,14 @@ small{color:#888}
     <button class="stop" onclick="send('stop')">停下</button>
     <button class="come" onclick="send('come')">过来</button>
     <button class="report" onclick="send('report')">报告</button>
+    <button onclick="send('forward')">前进</button>
+    <button onclick="send('backward')">后退</button>
+    <button onclick="send('turn_left')">左转</button>
+    <button onclick="send('turn_right')">右转</button>
+    <button onclick="send('look')">看我</button>
     <div id="chat"></div>
     <div class="row">
-      <input id="text" placeholder="和小乐聊聊，或说：停下 / 过来 / 报告" onkeydown="if(event.key==='Enter')sendChat()">
+      <input id="text" placeholder="和小乐聊聊，或说：停下 / 过来 / 报告 / 前进 / 后退 / 左转 / 右转 / 看我" onkeydown="if(event.key==='Enter')sendChat()">
       <button onclick="sendChat()">发送</button>
     </div>
     <div class="row">
