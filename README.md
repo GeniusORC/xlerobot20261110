@@ -19,6 +19,17 @@ Working repository for the 智能养老服务领域轮式机器人关键技术�
 | `.venv-robot07` | 3.12 | LeRobot 0.7.0, XLeRobot 2-wheel plugin | Compatibility test only |
 | system | 3.12 | ROS 2 Jazzy, Nav2, RTAB-Map, realsense2_camera | Navigation / perception |
 
+## Health station
+
+```bash
+source scripts/env.sh voice
+python scripts/health_station_web.py --port 8084
+```
+
+Open `http://127.0.0.1:8084`; the robot stops, the head RGB camera captures a
+full-body walk, MediaPipe extracts 2D pose, and the result includes a pose
+screenshot, gait curves and metrics JSON under `data/health/`.
+
 ## Quick checks
 
 ```bash

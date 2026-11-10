@@ -423,3 +423,32 @@ python scripts/voice_auto_web.py --port 8082
 ```
 
 `CAPTURE_DEV`/`PLAYBACK_DEV` can override the ALSA device names.
+
+## 13. Fixed health station (RGB + MediaPipe)
+
+`scripts/health_station_web.py` implements the fixed-station gait/posture demo:
+
+```bash
+source scripts/env.sh voice
+python scripts/health_station_web.py --port 8084
+```
+
+Open `http://127.0.0.1:8084`.
+
+- “准备（停车）” calls the robot API stop.
+- “开始采集 10 秒” captures head-camera snapshots from
+  `http://127.0.0.1:8080/snapshot/head` at 10 Hz.
+- MediaPipe PoseLandmarker (Tasks API, `models/pose_landmarker_lite.task`)
+  extracts 33 landmarks per frame.
+- Outputs:
+  - `data/health/pose_<ts>.png` — annotated full-body screenshot
+  - `data/health/gait_<ts>.png` — knee/hip/ankle curves
+  - `data/health/metrics_<ts>.json` — step count, cadence, knee/hip angles,
+    trunk angle, symmetry, normalized step length, sway
+- The page shows live head RGB, progress, metrics and the result images.
+
+The person must stand 2–3 m in front of the robot with the full body visible.
+If no full body is detected, the page reports “没有检测到完整人体”.
+
+A static-image pipeline test with MediaPipe's sample `pose.jpg` produced
+15 valid frames, knee/hip/trunk metrics, a pose overlay and a gait plot.
