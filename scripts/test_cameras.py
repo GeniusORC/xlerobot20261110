@@ -44,9 +44,14 @@ def main() -> int:
                 frames[name] = cam.async_read()
         dt = time.time() - t0
         for name, frame in frames.items():
-            cv2.imwrite(f"data/cam_{name}.png", frame)
-            print(f"{name}: {frame.shape} dtype={frame.dtype} mean={float(np.mean(frame)):.1f}")
-            print(f"  saved data/cam_{name}.png")
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+            sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            # LeRobot returns RGB; cv2.imwrite expects BGR.
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f"data/cam_{name}.png", bgr)
+            print(f"{name}: {frame.shape} dtype={frame.dtype} "
+                  f"mean={float(np.mean(frame)):.1f} sharpness={sharpness:.1f}")
+            print(f"  saved data/cam_{name}.png (RGB->BGR for OpenCV)")
         print(f"20 rounds in {dt:.2f}s -> {20 / dt:.1f} rounds/s (3 cameras)")
         return 0
     finally:
