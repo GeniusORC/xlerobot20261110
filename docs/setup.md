@@ -310,3 +310,43 @@ The D455 is not used for now. The robot has three USB RGB cameras:
 For the temporary RGB-only setup, use `/dev/video6` as the head camera. Without
 D455 depth/IMU, navigation and gait work must use monocular vision and wheel
 odometry; the 90° test angle must come from a floor/phone measurement.
+
+## 9. Direction check and short validation
+
+After the final `INVERT_LINEAR_DIRECTION` patch, the interactive direction check
+reported:
+
+```text
+FORWARD_OK
+LEFT_OK
+```
+
+Short validation on the ground:
+
+- straight: 0.1 m/s for 5.0 s (target 0.5 m); encoder distance magnitude 0.490 m
+- turn: 20 deg/s for 4.5 s (target 90 deg); wheel arc difference 0.6226 m
+- with wheelbase 0.414 m, the implied body angle is
+  `0.6226 / 0.414 = 1.504 rad = 86.2 deg`; measure the actual floor angle to
+  confirm 0.414 m
+- the encoder sign is negative for physical forward on this build; magnitude is
+  used for distance/wheelbase calculations
+
+## 10. Keyboard teleop
+
+```bash
+source scripts/env.sh robot
+python scripts/teleop_base.py
+```
+
+Keys:
+
+```text
+w / s      forward / backward
+a / d      rotate left / right
+space      stop
+1 / 2 / 3  speed level
+q or Esc   quit
+```
+
+The script holds the current arm pose and commands only the base. It stops the
+base on every idle loop and disconnects in `finally`.
