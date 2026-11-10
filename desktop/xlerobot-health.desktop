@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=XLeRobot 固定健康站
+Comment=RGB + MediaPipe 2D gait/posture health station
+Exec=bash -c 'cd /home/adminchen/Documents/xlerobot && source scripts/env.sh voice && exec python scripts/health_station_app.py'
+Icon=camera-video
+Terminal=false
+Categories=Science;Education;
+StartupNotify=true

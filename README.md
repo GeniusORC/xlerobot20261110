@@ -21,14 +21,17 @@ Working repository for the 智能养老服务领域轮式机器人关键技术�
 
 ## Health station
 
+Desktop GUI (no port 8084):
+
 ```bash
 source scripts/env.sh voice
-python scripts/health_station_web.py --port 8084
+python scripts/health_station_app.py
 ```
 
-Open `http://127.0.0.1:8084`; the robot stops, the head RGB camera captures a
-full-body walk, MediaPipe extracts 2D pose, and the result includes a pose
-screenshot, gait curves and metrics JSON under `data/health/`.
+The robot stops, the head RGB camera captures a full-body walk, MediaPipe
+extracts 2D pose, and the result includes a pose screenshot, gait curves and
+metrics JSON under `data/health/`. The app is also in the desktop application
+menu as **XLeRobot 固定健康站**.
 
 ## Quick checks
 

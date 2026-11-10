@@ -452,3 +452,23 @@ If no full body is detected, the page reports “没有检测到完整人体”.
 
 A static-image pipeline test with MediaPipe's sample `pose.jpg` produced
 15 valid frames, knee/hip/trunk metrics, a pose overlay and a gait plot.
+
+## 14. Desktop health-station app (no 8084)
+
+`scripts/health_station_app.py` is the GUI version; it does not need port 8084:
+
+```bash
+source scripts/env.sh voice
+python scripts/health_station_app.py
+```
+
+Or launch from the application menu: **XLeRobot 固定健康站**
+(desktop entry installed at `~/.local/share/applications/xlerobot-health.desktop`).
+
+- Tk window with live camera, pose overlay, progress and metrics.
+- Buttons: 准备（停车） / 开始采集 10 秒 / 停止 / 打开结果文件夹.
+- Opens `/dev/video0` directly if free; otherwise falls back to
+  `http://127.0.0.1:8080/snapshot/head`.
+- Calls `robot_api.py` on port 8090 to stop the base before capture.
+- Saves `pose_*.png`, `gait_*.png`, `metrics_*.json` under `data/health/`.
+- Uses `models/pose_landmarker_lite.task` and MediaPipe Tasks.
