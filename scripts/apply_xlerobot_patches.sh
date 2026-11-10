@@ -6,4 +6,7 @@ if [ ! -d XLeRobot ]; then
   echo "XLeRobot/ not found; clone it first (see docs/setup.md)" >&2
   exit 1
 fi
-patch -p1 -d XLeRobot < patches/0001-invert-wheel-direction.patch
+for p in patches/*.patch; do
+  echo "Applying $p"
+  patch --forward -p1 -d XLeRobot < "$p"
+done

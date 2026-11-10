@@ -299,17 +299,32 @@ Formula:
 L_actual = wheel_arc_difference / actual_body_angle_rad
 ```
 
-### Camera note
+### RGB camera configuration
 
-The D455 is not used for now. The robot has three USB RGB cameras:
+The D455 is not used for now. The three robot RGB cameras are configured in
+`config_xlerobot_2wheels.py` (patch `0002-configure-rgb-cameras.patch`):
 
-- `/dev/video0`, `/dev/video2`: wrist views
-- `/dev/video6`: head view (arms/cart visible from above)
-- `/dev/video8`: laptop webcam
+| Name | Device | Resolution | Notes |
+|---|---|---|---|
+| `left_wrist` | `/dev/video0` | 640x480@30 | left wrist |
+| `right_wrist` | `/dev/video2` | 640x480@30 | right wrist |
+| `head` | `/dev/video6` | 640x480@30 | head, currently aimed downward |
 
-For the temporary RGB-only setup, use `/dev/video6` as the head camera. Without
-D455 depth/IMU, navigation and gait work must use monocular vision and wheel
-odometry; the 90° test angle must come from a floor/phone measurement.
+Verify all three simultaneously:
+
+```bash
+source scripts/env.sh robot
+python scripts/test_cameras.py
+```
+
+Verified: all three open together, `get_observation()` returns
+`left_wrist`, `right_wrist`, `head` as `(480, 640, 3) uint8`, and 20 rounds of
+three frames take ~0.75 s (~26.5 rounds/s total).
+
+The head camera currently sees the arms/cart from above; tilt it up if it should
+see a person's body for approach/gait work. Without D455 depth/IMU, navigation
+and gait work must use monocular vision and wheel odometry; the 90° test angle
+must come from a floor/phone measurement.
 
 ## 9. Direction check and short validation
 
