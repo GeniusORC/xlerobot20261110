@@ -366,6 +366,9 @@ input{font-size:16px;padding:11px;border-radius:9px;border:0;flex:1;min-width:0}
 #status{font-size:12px;color:#9c9;margin-top:8px;word-break:break-all}
 img{width:100%;background:#000;border-radius:8px;margin-top:8px}
 small{color:#888}
+.camwrap{display:none}
+.camwrap.on{display:block}
+.camsw{font-size:13px;padding:8px 11px;margin:2px}
 </style></head><body>
 <h1>XLeRobot 养老陪伴</h1>
 <div class="grid">
@@ -391,12 +394,15 @@ small{color:#888}
   </div>
   <div class="card">
     <strong>实时相机</strong>
-    <img id="cam_head" src="">
-    <small>head /dev/video0</small>
-    <img id="cam_left" src="">
-    <small>left /dev/video6</small>
-    <img id="cam_right" src="">
-    <small>right /dev/video2</small>
+    <div>
+      <button class="camsw" onclick="showCam('head')">头部</button>
+      <button class="camsw" onclick="showCam('left')">左腕</button>
+      <button class="camsw" onclick="showCam('right')">右腕</button>
+      <button class="camsw" onclick="showCam('all')">三路</button>
+    </div>
+    <div id="wrap_head" class="camwrap"><img id="cam_head" src=""><small>head /dev/video0</small></div>
+    <div id="wrap_left" class="camwrap"><img id="cam_left" src=""><small>left /dev/video6</small></div>
+    <div id="wrap_right" class="camwrap"><img id="cam_right" src=""><small>right /dev/video2</small></div>
   </div>
 </div>
 <script>
@@ -404,6 +410,12 @@ const camBase = location.protocol + '//' + location.hostname + ':8080';
 document.getElementById('cam_head').src = camBase + '/stream/head?ts=' + Date.now();
 document.getElementById('cam_left').src = camBase + '/stream/left?ts=' + Date.now();
 document.getElementById('cam_right').src = camBase + '/stream/right?ts=' + Date.now();
+function showCam(name){
+  for(const n of ['head','left','right']){
+    document.getElementById('wrap_'+n).classList.toggle('on', name==='all' || name===n);
+  }
+}
+showCam('all');
 const chatEl=document.getElementById('chat');
 function addMsg(role,text){
   const d=document.createElement('div');
