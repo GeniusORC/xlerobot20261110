@@ -48,8 +48,8 @@ ros2 launch realsense2_camera rs_launch.py \
 - D455 must be on a direct USB3 port where possible. A hub plus stale ROS nodes caused
   stream drops/1–3 Hz; after killing stale nodes it runs at ~30 Hz.
 - LeRobot 0.7 now passes `connect()/configure()/disconnect()`, calibration restore,
-  and normalized joint reads on the powered robot. Values are identical to 0.6.1.
-  Wheel velocity commands and a 10-minute teleop are still pending; keep 0.6.1 as
-  the main environment until then.
+  normalized joint reads, and the lifted-wheel speed test. Values/commands are
+  equivalent to 0.6.1. On-ground odometry and a 10-minute teleop are still pending;
+  keep 0.6.1 as the main environment until then.
 
 See `docs/setup.md` for details.

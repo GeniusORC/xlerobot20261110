@@ -199,10 +199,34 @@ source scripts/env.sh robot07
 # same command
 ```
 
-## 7. Next steps
+## 7. Wheel-speed smoke test
 
-1. Run calibration; measure wheelbase; record 10–20 teleop episodes.
-2. Compare 0.6.1 vs 0.7 on the calibrated robot; keep 0.6.1 as main until 0.7
-   passes calibration + teleop for at least 10 minutes.
+Run with the wheels lifted/on blocks and a physical E-stop within reach:
+
+```bash
+source scripts/env.sh robot
+python scripts/test_wheel_speed.py --yes
+```
+
+Verified on both environments (0.6.1 and 0.7.0), 0.03 m/s / 10 deg/s, 0.8 s per command:
+
+| Command | Left raw | Right raw | Result |
+|---|---:|---:|---|
+| forward | -300 | +300 | both wheels forward |
+| reverse | +300 | -300 | both wheels backward |
+| rotate left | +200 | +200 | left backward / right forward |
+| rotate right | -200 | -200 | left forward / right backward |
+
+The left motor is mounted mirrored, so its raw sign is inverted in the code.
+After `stop_base()` the wheel velocities return to 0 within about 0.4 s.
+0.6.1 and 0.7.0 produce the same commands and comparable feedback.
+
+Next: measure the wheelbase, then run a 1 m straight-line odometry test on the
+ground and a 90° turn test.
+
+## 8. Next steps
+
+1. Measure wheelbase; run 1 m straight + 90° turn on the ground.
+2. Record 10–20 teleop episodes; compare 0.6.1 vs 0.7 for 10 minutes.
 3. Add a USB mic array/speaker; test 1–3 m ASR with servo noise.
 4. Map the lab with RTAB-Map/Nav2.
