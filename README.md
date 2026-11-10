@@ -41,7 +41,8 @@ ros2 launch realsense2_camera rs_launch.py \
 ## Known issues
 
 - The XLeRobot config defaults to `wheel_radius=0.05`; the 5-inch wheel radius is
-  **0.0635 m**. Set it explicitly for correct odometry, and measure the wheelbase.
+  **0.0635 m**. The IKEA RÅSKOG build has an estimated **0.367 m** wheelbase
+  (cart width 0.35 m + mounts); measure center-to-center to confirm.
 - Motor-bus mapping (1 Mbaud):
   - `/dev/xlerobot_serial_b` → IDs 1–8 → **bus1** (left arm + head), use as `port1`
   - `/dev/xlerobot_serial_a` → IDs 1–6, 9, 10 → **bus2** (right arm + 2 wheels), use as `port2`

@@ -19,7 +19,7 @@ def main() -> int:
     ap.add_argument("--port1", default="/dev/xlerobot_serial_b")  # left arm + head (IDs 1-8)
     ap.add_argument("--port2", default="/dev/xlerobot_serial_a")  # right arm + wheels (1-6,9,10)
     ap.add_argument("--wheel-radius", type=float, default=0.0635)
-    ap.add_argument("--wheelbase", type=float, default=0.25)
+    ap.add_argument("--wheelbase", type=float, default=0.367)
     ap.add_argument("--skip-calibration", action="store_true", help="compatibility test only: do not run interactive calibration")
     args = ap.parse_args()
 

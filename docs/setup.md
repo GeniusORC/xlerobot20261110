@@ -133,12 +133,31 @@ wheelbase: float = 0.25
 ```
 
 For the 5-inch wheels, set `wheel_radius=0.0635` (measured value preferred).
-Measure the actual wheelbase; the default 0.25 m is only a starting point.
+The upstream default `wheelbase=0.25` is too small for the IKEA RÅSKOG build.
+
+### Estimated wheelbase from the cart/CAD
+
+The RÅSKOG cart is 350 mm wide. The 0.4.0 dual-wheel base assembly
+(`XLeRobot040_dualwheelbase.step`) spans 367 mm laterally, with the wheel
+mounts at the two sides. A reasonable starting value is therefore:
+
+```text
+wheelbase ≈ 0.367 m  (367 mm); expected range 0.36–0.40 m
+```
+
+This is an estimate from the cart width and base CAD, not a substitute for a
+tape measurement. Measure the **center-to-center** distance between the two
+drive wheels and update the value if it differs.
+
 Example override when running a LeRobot CLI:
 
 ```bash
---robot.wheel_radius=0.0635 --robot.wheelbase=<measured>
+--robot.wheel_radius=0.0635 --robot.wheelbase=0.367
 ```
+
+With the wrong wheelbase, straight motion is mostly unaffected but turns are:
+using 0.25 m when the real value is 0.367 m makes a commanded turn roughly
+32% smaller than requested.
 
 ### Verified motor mapping (1 Mbaud)
 
