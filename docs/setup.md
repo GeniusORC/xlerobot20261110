@@ -249,3 +249,30 @@ ground and a 90° turn test.
 2. Record 10–20 teleop episodes; compare 0.6.1 vs 0.7 for 10 minutes.
 3. Add a USB mic array/speaker; test 1–3 m ASR with servo noise.
 4. Map the lab with RTAB-Map/Nav2.
+
+## 8. Odometry test (preliminary, 2026-11-10)
+
+Script: `scripts/test_odometry.py`
+
+Straight phase:
+
+- command: 0.15 m/s for 6.7 s (expected 1.005 m)
+- encoder wheel angle: 893.85 deg average
+- encoder distance with r=0.0635 m: **0.991 m**
+- actual tape measurement still needed to refine the wheel radius
+
+Turn phase:
+
+- command: 20 deg/s for 4.5 s (expected 90 deg)
+- encoder wheel arc difference: **+0.5779 m**
+- D455 was not connected, so the IMU could not measure the actual body angle
+- if the actual turn is 90 deg, inferred wheelbase = 0.5779 / (pi/2) = **0.368 m**,
+  consistent with the 0.367 m CAD/cart estimate
+- to confirm independently, reconnect the D455 (gyro) or measure the actual
+  rotation angle with a phone/protractor and rerun with `--angle <deg>`
+
+Formula used:
+
+```text
+L_actual = wheel_arc_difference / actual_body_angle_rad
+```
