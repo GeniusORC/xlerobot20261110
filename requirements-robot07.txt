@@ -1,0 +1,4 @@
+# LeRobot 0.7 compatibility-test environment: Python 3.12
+# Keep this separate from the main 0.6.1 robot environment.
+lerobot[feetech]==0.7.0
+pyzmq==27.3.0

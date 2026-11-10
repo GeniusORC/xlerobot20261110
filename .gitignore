@@ -1,0 +1,16 @@
+.venv/
+.venv-robot/
+.venv-robot07/
+XLeRobot/
+data/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
+*.png
+.pytest_cache/
+
+# Sensitive / large local files
+*.doc
+*.docx
+*.pdf

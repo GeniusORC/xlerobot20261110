@@ -1,0 +1,6 @@
+# Main robot environment: Python 3.12
+# XLeRobot plugins are installed editable from the upstream clone:
+#   uv pip install -e XLeRobot/software/plugins/xlerobot_model --no-deps
+#   uv pip install -e XLeRobot/software/plugins/lerobot_robot_xlerobot_2wheels --no-deps
+lerobot[feetech]==0.6.1
+pyzmq==27.3.0
