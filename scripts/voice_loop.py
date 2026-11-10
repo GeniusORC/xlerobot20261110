@@ -11,8 +11,8 @@ import soundfile as sf
 import torch
 from scipy.signal import resample_poly
 
-CAPTURE_DEV = "plughw:2,0"
-PLAYBACK_DEV = "plughw:2,0"
+CAPTURE_DEV = os.environ.get("CAPTURE_DEV", "default")
+PLAYBACK_DEV = os.environ.get("PLAYBACK_DEV", "default")
 SR = 16000
 
 

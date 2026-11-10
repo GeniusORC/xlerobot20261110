@@ -396,3 +396,30 @@ All motion commands are 0.05 m/s / 20 deg/s, stop on timeout, and can be
 preempted by “停下”. The `look` command fetches `/snapshot/head` from the camera
 server and rotates the base until the largest detected face is centered; if no
 face is found it reports “没有看到您的脸”.
+
+## 12. Always-on voice agent
+
+No push-to-talk button is needed. `scripts/voice_auto_web.py` runs a server-side
+microphone loop:
+
+```text
+arecord (default) -> Silero VAD -> SenseVoice -> intent/chat -> TTS -> aplay
+```
+
+- `default` is used for capture/playback because the ALSA card indices changed
+  from `2` to `0`; `plughw:2,0` is no longer valid.
+- Speech end is detected after ~0.6 s of silence; replies are spoken through the
+  laptop speaker.
+- The microphone is muted during TTS playback plus a 2 s tail; an additional
+  text-similarity filter ignores the robot's own voice.
+- Web UI: `http://127.0.0.1:8082`; messages are polled from `/api/messages`.
+- “暂停监听/继续监听” toggles the mic loop without stopping the web server.
+
+Run:
+
+```bash
+source scripts/env.sh voice
+python scripts/voice_auto_web.py --port 8082
+```
+
+`CAPTURE_DEV`/`PLAYBACK_DEV` can override the ALSA device names.
