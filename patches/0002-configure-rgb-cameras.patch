@@ -26,7 +26,7 @@
 -        #     use_depth=True
 -        # ),
 +        "left_wrist": OpenCVCameraConfig(
-+            index_or_path="/dev/video0",
++            index_or_path="/dev/video6",
 +            fps=30,
 +            width=640,
 +            height=480,
@@ -40,7 +40,7 @@
 +            rotation=Cv2Rotation.NO_ROTATION,
 +        ),
 +        "head": OpenCVCameraConfig(
-+            index_or_path="/dev/video6",
++            index_or_path="/dev/video0",
 +            fps=30,
 +            width=640,
 +            height=480,

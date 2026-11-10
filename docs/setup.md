@@ -306,9 +306,9 @@ The D455 is not used for now. The three robot RGB cameras are configured in
 
 | Name | Device | Resolution | Notes |
 |---|---|---|---|
-| `left_wrist` | `/dev/video0` | 640x480@30 | left wrist |
-| `right_wrist` | `/dev/video2` | 640x480@30 | right wrist |
-| `head` | `/dev/video6` | 640x480@30 | head, currently aimed downward |
+| `left_wrist` | `/dev/video6` | 640x480@30 | left wrist (sharp) |
+| `right_wrist` | `/dev/video2` | 640x480@30 | right wrist (soft) |
+| `head` | `/dev/video0` | 640x480@30 | head (blurry, needs focus) |
 
 Verify all three simultaneously:
 
@@ -321,8 +321,18 @@ Verified: all three open together, `get_observation()` returns
 `left_wrist`, `right_wrist`, `head` as `(480, 640, 3) uint8`, and 20 rounds of
 three frames take ~0.75 s (~26.5 rounds/s total).
 
-The head camera currently sees the arms/cart from above; tilt it up if it should
-see a person's body for approach/gait work. Without D455 depth/IMU, navigation
+Camera labels were corrected after a physical check: `/dev/video0` is the head,
+`/dev/video6` is the left wrist, and `/dev/video2` is the right wrist.
+
+Measured sharpness (Laplacian variance) with the corrected mapping:
+
+- left wrist `/dev/video6`: ~462 (sharp)
+- right wrist `/dev/video2`: ~32 (soft)
+- head `/dev/video0`: ~15 (blurry)
+
+The head camera is currently the blurry one. These UVC cameras expose no V4L2
+focus control, so clean the lens / remove any protective film and turn the
+manual focus ring to the working distance. Without D455 depth/IMU, navigation
 and gait work must use monocular vision and wheel odometry; the 90° test angle
 must come from a floor/phone measurement.
 
