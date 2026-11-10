@@ -33,6 +33,12 @@ extracts 2D pose, and the result includes a pose screenshot, gait curves and
 metrics JSON under `data/health/`. The app is also in the desktop application
 menu as **XLeRobot 固定健康站**.
 
+## Chat LLM
+
+`scripts/env.sh` loads `~/.config/xlerobot/llm.env` if present (chmod 600).
+Set `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (e.g. DeepSeek `deepseek-chat`)
+to use the real LLM; otherwise the local companion fallback is used.
+
 ## Quick checks
 
 ```bash

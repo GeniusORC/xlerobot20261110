@@ -472,3 +472,25 @@ Or launch from the application menu: **XLeRobot 固定健康站**
 - Calls `robot_api.py` on port 8090 to stop the base before capture.
 - Saves `pose_*.png`, `gait_*.png`, `metrics_*.json` under `data/health/`.
 - Uses `models/pose_landmarker_lite.task` and MediaPipe Tasks.
+
+## 15. LLM chat backend
+
+The auto voice agent uses an OpenAI-compatible LLM if these variables are set:
+
+```bash
+export LLM_BASE_URL=https://api.deepseek.com/v1
+export LLM_API_KEY=...
+export LLM_MODEL=deepseek-chat
+```
+
+For local use, put them in a git-ignored, user-only file:
+
+```text
+~/.config/xlerobot/llm.env   (chmod 600)
+```
+
+`scripts/env.sh` sources that file automatically. Never commit the key.
+
+Verified with DeepSeek `deepseek-chat`: `/api/chat` returned `engine: "llm"` and
+a natural reply, then TTS spoke it. Without the variables it falls back to the
+local rule-based companion.

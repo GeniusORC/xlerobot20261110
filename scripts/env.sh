@@ -6,6 +6,11 @@
 
 export PATH="$HOME/.local/bin:$PATH"
 
+# Optional local-only LLM credentials (never committed)
+if [ -f "$HOME/.config/xlerobot/llm.env" ]; then
+  source "$HOME/.config/xlerobot/llm.env"
+fi
+
 # ROS 2's setup.bash is not `set -u` clean. Temporarily disable nounset while
 # sourcing it, then restore the caller's state.
 case $- in
