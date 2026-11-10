@@ -39,21 +39,35 @@ def main() -> int:
         print("WARNING: skipping interactive calibration (compatibility test only)")
         robot.calibrate = lambda: None
 
+    # If a calibration file exists, connect() asks whether to restore it.
+    # Answer ENTER non-interactively; calibrate=False avoids falling back to
+    # the interactive manual calibration if restore fails.
+    import builtins
+
+    _orig_input = builtins.input
+    builtins.input = lambda *a, **k: ""
     try:
-        robot.connect()
+        # calibrate=False means: restore the existing calibration if present;
+        # never fall into the interactive manual calibration.
+        robot.connect(calibrate=False)
         print("connected")
+        print("raw bus1 positions:", robot.bus1.sync_read("Present_Position", robot.left_arm_motors, normalize=False))
+        print("raw bus2 positions:", robot.bus2.sync_read("Present_Position", robot.right_arm_motors, normalize=False))
+        print("raw head:", robot.bus1.sync_read("Present_Position", robot.head_motors, normalize=False))
+        print("raw wheels velocity:", robot.bus2.sync_read("Present_Velocity", robot.base_motors, normalize=False))
         if robot.is_calibrated:
-            print("bus1 positions:", robot.bus1.sync_read("Present_Position", robot.left_arm_motors))
-            print("bus2 positions:", robot.bus2.sync_read("Present_Position", robot.right_arm_motors))
-            print("head:", robot.bus1.sync_read("Present_Position", robot.head_motors))
-            print("wheels:", robot.bus2.sync_read("Present_Velocity", robot.base_motors))
+            print("norm bus1 positions:", robot.bus1.sync_read("Present_Position", robot.left_arm_motors))
+            print("norm bus2 positions:", robot.bus2.sync_read("Present_Position", robot.right_arm_motors))
+            print("norm head:", robot.bus1.sync_read("Present_Position", robot.head_motors))
+            print("norm wheels:", robot.bus2.sync_read("Present_Velocity", robot.base_motors))
         else:
-            print("not calibrated: skipping position reads (run calibration first)")
+            print("not calibrated: skipping normalized reads (run calibration first)")
         return 0
     except Exception:
         traceback.print_exc()
         return 1
     finally:
+        builtins.input = _orig_input
         try:
             robot.disconnect()
             print("disconnected")

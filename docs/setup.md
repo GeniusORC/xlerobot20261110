@@ -105,9 +105,21 @@ Powered-robot test on 0.7.0:
 
 - `connect()` → `configure()` → `disconnect()` passes, including the register
   writes for operating mode / P-I-D coefficients and torque enable/disable.
-- Still pending: interactive calibration, normalized position reads, wheel
-  velocity commands, and a 10-minute teleop. Keep 0.6.1 as the main environment
-  until these pass.
+- Calibration file restore (`write_calibration`) passes.
+- Raw and normalized joint-position reads are numerically identical to 0.6.1
+  on the same calibrated robot (all 16 motors, same values).
+- Still pending: wheel velocity commands and a 10-minute teleop. Keep 0.6.1
+  as the main environment until these pass.
+
+Normalized read is a read-only observation, not a motion command:
+
+```python
+robot.bus1.sync_read("Present_Position", robot.left_arm_motors)  # normalize=True
+robot.bus1.sync_read("Present_Position", robot.left_arm_motors, normalize=False)  # raw ticks
+```
+
+The calibration file is at
+`~/.cache/huggingface/lerobot/calibration/robots/xlerobot_2wheels/xlerobot.json`.
 
 ## 5. XLeRobot 2-wheel notes
 

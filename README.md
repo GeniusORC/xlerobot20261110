@@ -47,8 +47,9 @@ ros2 launch realsense2_camera rs_launch.py \
   - `/dev/xlerobot_serial_a` → IDs 1–6, 9, 10 → **bus2** (right arm + 2 wheels), use as `port2`
 - D455 must be on a direct USB3 port where possible. A hub plus stale ROS nodes caused
   stream drops/1–3 Hz; after killing stale nodes it runs at ~30 Hz.
-- LeRobot 0.7 now passes `connect()/configure()/disconnect()` on the powered robot,
-  same as 0.6.1. Calibration and teleop are still to be completed before switching.
-  Keep 0.6.1 as the main environment until then.
+- LeRobot 0.7 now passes `connect()/configure()/disconnect()`, calibration restore,
+  and normalized joint reads on the powered robot. Values are identical to 0.6.1.
+  Wheel velocity commands and a 10-minute teleop are still pending; keep 0.6.1 as
+  the main environment until then.
 
 See `docs/setup.md` for details.
