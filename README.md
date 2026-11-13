@@ -28,10 +28,11 @@ source scripts/env.sh voice
 python scripts/health_station_app.py
 ```
 
-The robot stops, the head RGB camera captures a full-body walk, MediaPipe
-extracts 2D pose, and the result includes a pose screenshot, gait curves and
-metrics JSON under `data/health/`. The app is also in the desktop application
-menu as **XLeRobot 固定健康站**.
+The robot stops, the head D455 captures a full-body walk (colour + aligned
+depth), MediaPipe extracts 2D pose, and the result includes a pose screenshot,
+gait curves and metrics JSON under `data/health/`. With depth, the report also
+gives the standing distance and the step length in **metres**. The app is also
+in the desktop application menu as **XLeRobot 固定健康站**.
 
 ## Chat LLM
 
@@ -44,6 +45,9 @@ to use the real LLM; otherwise the local companion fallback is used.
 ```bash
 # D455 (USB3, ~30 Hz color + depth)
 .venv/bin/python scripts/test_d455.py
+
+# Depth-assisted gait maths + /snapshot/head_npz transport
+.venv/bin/python scripts/test_health_depth.py
 
 # Voice loop (built-in mic; use headset/USB array mic for far field)
 .venv/bin/python scripts/voice_loop.py --record 5

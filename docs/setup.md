@@ -428,7 +428,7 @@ python scripts/voice_auto_web.py --port 8082
 
 `CAPTURE_DEV`/`PLAYBACK_DEV` can override the ALSA device names.
 
-## 13. Fixed health station (RGB + MediaPipe)
+## 13. Fixed health station (D455 colour + depth + MediaPipe)
 
 `scripts/health_station_web.py` implements the fixed-station gait/posture demo:
 
@@ -440,16 +440,20 @@ python scripts/health_station_web.py --port 8084
 Open `http://127.0.0.1:8084`.
 
 - “准备（停车）” calls the robot API stop.
-- “开始采集 10 秒” captures head-camera snapshots from
-  `http://127.0.0.1:8080/snapshot/head` at 10 Hz.
+- “开始采集 10 秒” captures head-camera frames from
+  `http://127.0.0.1:8080/snapshot/head_npz` at 10 Hz. That endpoint returns the
+  colour JPEG **and** the D455 depth aligned to colour, plus camera intrinsics,
+  so one request gives both 2D pose and metric depth.
 - MediaPipe PoseLandmarker (Tasks API, `models/pose_landmarker_lite.task`)
   extracts 33 landmarks per frame.
 - Outputs:
   - `data/health/pose_<ts>.png` — annotated full-body screenshot
-  - `data/health/gait_<ts>.png` — knee/hip/ankle curves
+  - `data/health/gait_<ts>.png` — knee/hip/ankle curves, plus foot excursion
+    and body distance in metres when depth is available
   - `data/health/metrics_<ts>.json` — step count, cadence, knee/hip angles,
-    trunk angle, symmetry, normalized step length, sway
-- The page shows live head RGB, progress, metrics and the result images.
+    trunk angle, symmetry, normalized step length, sway, `distance_m`,
+    `step_length_m`, `walk_axis`, `depth_frames`
+- The page shows live head colour, progress, metrics and the result images.
 
 The person must stand 2–3 m in front of the robot with the full body visible.
 If no full body is detected, the page reports “没有检测到完整人体”.
@@ -471,10 +475,12 @@ Or launch from the application menu: **XLeRobot 固定健康站**
 
 - Tk window with live camera, pose overlay, progress and metrics.
 - Buttons: 准备（停车） / 开始采集 10 秒 / 停止 / 打开结果文件夹.
-- Opens `/dev/video0` directly if free; otherwise falls back to
-  `http://127.0.0.1:8080/snapshot/head`.
+- Defaults to `http://127.0.0.1:8080/snapshot/head` and automatically uses the
+  depth-packed endpoint; `--source realsense:333422300185` opens the D455
+  directly (stop `camera_web.py` first, single owner).
 - Calls `robot_api.py` on port 8090 to stop the base before capture.
-- Saves `pose_*.png`, `gait_*.png`, `metrics_*.json` under `data/health/`.
+- Saves `pose_*.png`, `gait_*.png`, `metrics_*.json` under `data/health/`
+  and writes the session to `health.db`.
 - Uses `models/pose_landmarker_lite.task` and MediaPipe Tasks.
 
 ## 15. LLM chat backend
@@ -509,8 +515,9 @@ After each capture the health station now:
 4. saves everything to `data/health/health.db` (SQLite).
 
 Database table `sessions` stores: timestamp, duration, frames, steps, cadence,
-symmetry, risk, full metrics JSON, report text, tips JSON, pose/gait/json paths
-and `created_at`.
+symmetry, risk, full metrics JSON, report text, tips JSON, pose/gait/json paths,
+`created_at`, `distance_m`, `step_length_m` and a `depth` flag. Older databases
+are migrated in place with `ALTER TABLE` on startup.
 
 The web page at 8084 shows the report, tips, risk level and a history table
 (`/api/history`, `/api/session/<id>`); the newest DB row is loaded on startup.
@@ -584,3 +591,84 @@ python scripts/health_station_app.py --source realsense:333422300185
 ```
 
 In that mode, stop `camera_web.py` first (single D455 owner).
+
+## 19. Depth-assisted gait: metric distance and step length
+
+The health station previously reported a *normalized* step length (pixels
+divided by shoulder width), which depends on camera distance. With the D455 the
+station now reports metres.
+
+### Transport
+
+`camera_web.py` adds a packed snapshot endpoint:
+
+```text
+GET /snapshot/head_npz
+```
+
+It returns a compressed NumPy archive with:
+
+| key | type | meaning |
+|---|---|---|
+| `color_jpeg` | uint8[] | JPEG bytes of the colour frame |
+| `depth` | uint16[480,640] | depth aligned to colour, millimetres |
+| `fx`, `fy`, `cx`, `cy` | float | colour intrinsics |
+| `depth_scale` | float | metres per depth unit (0.001) |
+
+Measured on the D455: ~170 KiB per request, 20 requests in 0.52 s (~38 fps
+round-trip on localhost), colour `(480,640,3)`, depth `(480,640)` uint16,
+`fx=386.8 fy=386.3 cx=323.6 cy=248.2`.
+
+### Metric conversion
+
+For a landmark at pixel `(u,v)` with median depth `Z` in a small window:
+
+```text
+X = (u - cx) * Z / fx        (metres, camera frame)
+```
+
+Depth samples outside 0.15–9 m or invalid (0) are discarded; a window median is
+used so a single missing pixel cannot create a spike.
+
+### Distance
+
+`distance_m` is the median of the hip-midpoint depth over all valid frames. It
+drives the "stand at 2–3 m" check: the report adds a warning when the measured
+distance is outside 1.2–4.5 m.
+
+### Step length
+
+Step length is *not* the lateral ankle separation (that is stance width). It is
+the peak-to-peak forward excursion of each foot **relative to the body** along
+the walking axis:
+
+```text
+fwd_foot(t) = body_axis(t) - foot_axis(t)
+step_length = mean_over_feet( P95(fwd) - P5(fwd) )
+```
+
+The walking axis is chosen per session by comparing the body's depth range with
+its lateral range, so both "walk towards the robot" (axis Z) and "walk across
+the frame" (axis X) work. Excursions outside 0.02–1.2 m are rejected as tracking
+jumps. The gait plot gets a fourth panel with foot excursion and body distance.
+
+### Validation
+
+`scripts/test_health_depth.py` checks the transport and the maths:
+
+```text
+PASS npz endpoint reachable   170 KiB
+PASS depth shape matches colour
+PASS intrinsics plausible     fx=386.8 fy=386.3 cx=323.6 cy=248.2
+PASS hip distance is 2.5 m    2.500
+PASS ankle X from pinhole model   -0.250 / 0.250
+PASS step length recovers synthetic swing   got=0.59 true=0.59
+PASS lateral walk selects x axis
+PASS lateral step length recovered   0.48
+PASS no-depth still produces metrics
+PASS report mentions metre step length
+```
+
+Limitations: monocular-depth step length is an estimate (D455 depth noise,
+loose clothing, foot occlusion). It is suitable for trend monitoring, not for
+diagnosis or for replacing motion capture.

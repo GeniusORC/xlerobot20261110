@@ -48,9 +48,12 @@ def resolve_source(source: str) -> str:
 
 class Grabber:
     def __init__(self, source):
-        self.source = hs.Source(source)
+        self.source = hs.Source(source, depth=True)
         self.lock = threading.Lock()
         self.frame = None
+        self.depth = None
+        self.K = None
+        self.scale = 0.001
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
@@ -61,13 +64,26 @@ class Grabber:
         while not self.stop.is_set():
             f = self.source.read()
             if f is not None:
+                d, K = self.source.read_depth()
                 with self.lock:
                     self.frame = f
+                    self.depth = d
+                    self.K = K
+                    self.scale = self.source.depth_scale
             time.sleep(1.0 / 15.0)
 
     def latest(self):
         with self.lock:
             return None if self.frame is None else self.frame.copy()
+
+    def latest_with_depth(self):
+        """Frame plus the depth map captured alongside it (may be None)."""
+        with self.lock:
+            if self.frame is None:
+                return None, None, None, 0.001
+            return (self.frame.copy(),
+                    None if self.depth is None else self.depth.copy(),
+                    self.K, self.scale)
 
 
 class App:
@@ -141,6 +157,8 @@ class App:
             ("trunk_mean_deg", "躯干平均角 (°)"),
             ("trunk_std_deg", "躯干波动角 (°)"),
             ("knee_symmetry_pct", "膝对称性 (%)"),
+            ("distance_m", "站位距离 (米·深度)"),
+            ("step_length_m", "步长 (米·深度估算)"),
             ("step_length_norm", "步长 (归一化)"),
             ("sway_norm", "重心摆动 (归一化)"),
         ]
@@ -161,7 +179,7 @@ class App:
         tk.Button(right, text="打开结果文件夹", command=self.open_folder,
                   bg="#444", fg="white", font=("Sans", 11)).pack(anchor="w", pady=(2, 0))
         tk.Label(right, text="提示：老人站在 2–3 米处，露出全身。\n"
-                             "无深度相机，步长为归一化值。",
+                             "D455 深度用于真实步长（米）；无深度时退回归一化值。",
                  fg="#888", bg="#1d1d1f", font=("Sans", 9),
                  justify="left", anchor="w").pack(fill="x", pady=(10, 0))
 
@@ -225,7 +243,7 @@ class App:
                 elapsed = time.time() - start
                 if elapsed >= self.args.duration:
                     break
-                frame = self.grabber.latest()
+                frame, depth, K, scale = self.grabber.latest_with_depth()
                 if frame is None:
                     time.sleep(0.05)
                     continue
@@ -237,6 +255,8 @@ class App:
                     lms = res.pose_landmarks[0]
                     row = hs.extract(lms, w, h)
                     if row is not None:
+                        if depth is not None and K is not None:
+                            hs.add_depth(row, depth, K, scale)
                         series.append(row)
                         last_overlay = hs.draw_overlay(frame, lms)
                         self.root.after(0, self.show_frame, last_overlay)
@@ -260,9 +280,19 @@ class App:
             hs.plot_gait(series, 10, gait_path)
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(metrics, f, ensure_ascii=False, indent=2)
+            report, tips, risk = hs.make_report(metrics)
+            try:
+                hs.init_db()
+                hs.save_session(ts, metrics, report, tips, risk,
+                                os.path.basename(pose_path)
+                                if os.path.exists(pose_path) else None,
+                                os.path.basename(gait_path),
+                                os.path.basename(json_path))
+            except Exception:
+                traceback.print_exc()
             self.root.after(0, self.finish_ok, metrics,
                             pose_path if os.path.exists(pose_path) else "",
-                            gait_path, json_path)
+                            gait_path, json_path, report, risk)
         except Exception as e:
             traceback.print_exc()
             self.root.after(0, self.finish_error, f"{type(e).__name__}: {e}")
@@ -273,11 +303,14 @@ class App:
                 except Exception:
                     pass
 
-    def finish_ok(self, metrics, pose, gait, json_path):
-        self.latest = {"metrics": metrics, "pose": pose, "gait": gait, "json": json_path}
+    def finish_ok(self, metrics, pose, gait, json_path, report="", risk=""):
+        self.latest = {"metrics": metrics, "pose": pose, "gait": gait,
+                       "json": json_path, "report": report, "risk": risk}
         for k, var in self.metrics.items():
-            var.set(str(metrics.get(k, "-")))
-        self.result.set(f"骨架图: {pose}\n曲线: {gait}\n指标: {json_path}")
+            v = metrics.get(k)
+            var.set("-" if v is None else str(v))
+        self.result.set(f"风险等级：{risk or '-'}\n{report}\n"
+                        f"骨架图: {pose}\n曲线: {gait}\n指标: {json_path}")
         self.capture_running = False
         self.progress["value"] = 100
         self.btn_start.config(state="normal")
@@ -313,6 +346,7 @@ def main():
     ap.add_argument("--robot-api", default=hs.ROBOT_API)
     ap.add_argument("--duration", type=float, default=10.0)
     args = ap.parse_args()
+    hs.init_db()
     root = tk.Tk()
     App(root, args)
     root.mainloop()

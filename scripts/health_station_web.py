@@ -10,6 +10,7 @@ http://127.0.0.1:8080/snapshot/head
 """
 import argparse
 import glob
+import io
 import json
 import os
 import sqlite3
@@ -77,10 +78,22 @@ def make_landmarker():
 
 
 class Source:
-    def __init__(self, source):
+    """Colour (and optionally metric depth) source.
+
+    Depth-capable modes:
+      * ``realsense:SERIAL``  - opens the D455 directly (single owner).
+      * HTTP snapshot with ``depth=True`` - fetches ``.../snapshot/head_npz``
+        from camera_web, which returns colour + aligned depth + intrinsics.
+    """
+
+    def __init__(self, source, depth=False):
         self.source = source
         self.cap = None
         self.rs_pipe = None
+        self.depth_url = None
+        self._depth = None
+        self._K = None
+        self._depth_scale = 0.001
         if source.startswith("realsense:"):
             import pyrealsense2 as rs
             serial = source.split(":", 1)[1].strip()
@@ -88,27 +101,40 @@ class Source:
             if serial:
                 cfg.enable_device(serial)
             cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+            self._rs = rs
+            self._align = rs.align(rs.stream.color)
             self.rs_pipe = rs.pipeline()
-            self.rs_pipe.start(cfg)
+            profile = self.rs_pipe.start(cfg)
+            intr = profile.get_stream(
+                rs.stream.color).as_video_stream_profile().get_intrinsics()
+            self._K = (float(intr.fx), float(intr.fy), float(intr.ppx), float(intr.ppy))
+            try:
+                self._depth_scale = float(
+                    profile.get_device().first_depth_sensor().get_depth_scale())
+            except Exception:
+                self._depth_scale = 0.001
+        elif depth:
+            self.depth_url = derive_depth_url(source)
 
+    # -- colour ---------------------------------------------------------
     def read(self):
         if self.rs_pipe is not None:
             try:
-                frames = self.rs_pipe.wait_for_frames()
+                frames = self._align.process(self.rs_pipe.wait_for_frames())
                 color = frames.get_color_frame()
+                depth = frames.get_depth_frame()
+                if depth:
+                    self._depth = np.asanyarray(depth.get_data()).copy()
                 if color:
                     return np.asanyarray(color.get_data())
             except Exception:
                 return None
             return None
+        if self.depth_url:
+            return self._read_npz()
         if self.source.startswith("http://") or self.source.startswith("https://"):
-            try:
-                r = requests.get(self.source, timeout=2)
-                r.raise_for_status()
-                buf = np.frombuffer(r.content, np.uint8)
-                return cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            except Exception:
-                return None
+            return self._read_http_color()
         if self.source.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
             return cv2.imread(self.source)
         if self.cap is None:
@@ -120,6 +146,51 @@ class Source:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = self.cap.read()
         return frame if ok else None
+
+    def _read_http_color(self):
+        try:
+            r = requests.get(self.source, timeout=2)
+            r.raise_for_status()
+            buf = np.frombuffer(r.content, np.uint8)
+            return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        except Exception:
+            return None
+
+    def _read_npz(self):
+        try:
+            r = requests.get(self.depth_url, timeout=3)
+            r.raise_for_status()
+            z = np.load(io.BytesIO(r.content))
+            self._depth = np.asarray(z["depth"], dtype=np.uint16)
+            self._K = (float(z["fx"]), float(z["fy"]),
+                       float(z["cx"]), float(z["cy"]))
+            self._depth_scale = float(z["depth_scale"])
+            return cv2.imdecode(z["color_jpeg"], cv2.IMREAD_COLOR)
+        except Exception:
+            # Depth endpoint unavailable: keep the colour stream working.
+            self._depth = None
+            self.depth_url = None
+            return self._read_http_color()
+
+    # -- depth ----------------------------------------------------------
+    def read_depth(self):
+        """Return (depth_uint16_aligned_to_colour, K) or (None, None)."""
+        if self._depth is None or self._K is None:
+            return None, None
+        return self._depth, self._K
+
+    @property
+    def depth_scale(self):
+        return self._depth_scale
+
+
+def derive_depth_url(source):
+    """Map camera_web's colour snapshot URL to the depth-packed endpoint."""
+    s = source.rstrip("/")
+    if s.endswith("/snapshot/head"):
+        return s + "_npz"
+    return None
+
 
 
 def point(lms, idx, w, h, min_vis=0.3):
@@ -174,7 +245,60 @@ def extract(lms, w, h):
         "ankle_ry": float(p["RA"][1] / h),
         "hip_x": float(hip_mid[0] / shoulder_w),
         "shoulder_w": shoulder_w,
+        # Pixel positions kept for metric depth sampling (not stored in DB).
+        "px_hip": hip_mid,
+        "px_ankle_l": p["LA"],
+        "px_ankle_r": p["RA"],
     }
+
+
+def depth_patch(depth, u, v, radius=6, scale=0.001, lo=0.15, hi=9.0):
+    """Median metric depth (metres) in a small window; NaN if unusable."""
+    if depth is None:
+        return float("nan")
+    h, w = depth.shape[:2]
+    x0, x1 = max(0, int(u) - radius), min(w, int(u) + radius + 1)
+    y0, y1 = max(0, int(v) - radius), min(h, int(v) + radius + 1)
+    if x1 <= x0 or y1 <= y0:
+        return float("nan")
+    patch = depth[y0:y1, x0:x1].astype(np.float32) * float(scale)
+    patch = patch[(patch > lo) & (patch < hi)]
+    if patch.size < 5:
+        return float("nan")
+    return float(np.median(patch))
+
+
+def add_depth(row, depth, K, scale=0.001):
+    """Attach metric depth features to one pose row.
+
+    Uses the aligned depth map sampled at the hip and both ankles:
+
+      * ``dist_m``      body distance from the camera (hip midpoint)
+      * ``foot_l_x/z``  ankle position in metres in the camera frame
+      * ``hip_x_m``     hip lateral position in metres
+
+    Forward foot excursion relative to the body is computed in ``analyze``
+    after choosing the walking axis, so it works whether the person walks
+    towards the camera or across the frame.
+    """
+    fx, fy, cx, cy = K
+    hip = row.get("px_hip")
+    la = row.get("px_ankle_l")
+    ra = row.get("px_ankle_r")
+    if hip is None or la is None or ra is None:
+        return row
+    z_hip = depth_patch(depth, hip[0], hip[1], radius=10, scale=scale)
+    z_l = depth_patch(depth, la[0], la[1], radius=5, scale=scale)
+    z_r = depth_patch(depth, ra[0], ra[1], radius=5, scale=scale)
+    row["dist_m"] = z_hip
+    row["hip_x_m"] = (float(hip[0]) - cx) * z_hip / fx
+    row["foot_l_z"] = z_l
+    row["foot_r_z"] = z_r
+    row["foot_l_x"] = (float(la[0]) - cx) * z_l / fx
+    row["foot_r_x"] = (float(ra[0]) - cx) * z_r / fx
+    row["hip_z_m"] = z_hip
+    return row
+
 
 
 def draw_overlay(frame, lms):
@@ -196,7 +320,7 @@ def analyze(series, duration, fps):
     if not series:
         return None
     def arr(key):
-        return np.array([s[key] for s in series], dtype=float)
+        return np.array([s.get(key, np.nan) for s in series], dtype=float)
     t = np.arange(len(series)) / max(fps, 1e-6)
     kL, kR = arr("knee_l"), arr("knee_r")
     hL, hR = arr("hip_l"), arr("hip_r")
@@ -212,7 +336,7 @@ def analyze(series, duration, fps):
             step_count = 0
     sym = float(np.nanmean(np.abs(kL - kR)) /
                 max(1e-6, np.nanmean((kL + kR) / 2)) * 100)
-    return {
+    metrics = {
         "frames": len(series),
         "duration_s": round(duration, 2),
         "step_count": step_count,
@@ -229,13 +353,70 @@ def analyze(series, duration, fps):
         "step_length_norm": round(float(np.nanmax(np.abs(arr("ankle_lx") - arr("ankle_rx")))), 3),
         "sway_norm": round(float(np.nanstd(arr("hip_x"))), 3),
     }
+    metrics.update(metric_depth_metrics(series))
+    return metrics
+
+
+def metric_depth_metrics(series):
+    """Metre-scale distance and step length from the aligned D455 depth.
+
+    The walking axis is chosen per session (depth axis Z or lateral axis X)
+    so that walking towards the robot and walking across the frame both work.
+
+    Step length is the peak-to-peak excursion of each foot relative to the
+    body along the walking axis, averaged over both feet. It is an estimate
+    from monocular depth, not a motion-capture measurement.
+    """
+    out = {}
+    z = np.array([s.get("dist_m", np.nan) for s in series], dtype=float)
+    hx = np.array([s.get("hip_x_m", np.nan) for s in series], dtype=float)
+    z_ok = z[np.isfinite(z)]
+    out["depth_frames"] = int(z_ok.size)
+    if z_ok.size < 5:
+        out["depth_used"] = False
+        out["distance_m"] = None
+        out["step_length_m"] = None
+        out["walk_axis"] = None
+        return out
+    out["depth_used"] = True
+    out["distance_m"] = round(float(np.median(z_ok)), 2)
+    z_span = float(np.nanmax(z_ok) - np.nanmin(z_ok))
+    hx_ok = hx[np.isfinite(hx)]
+    x_span = float(np.nanmax(hx_ok) - np.nanmin(hx_ok)) if hx_ok.size >= 5 else 0.0
+    axis = "z" if z_span >= x_span else "x"
+    out["walk_axis"] = axis
+    body = z if axis == "z" else hx
+    ex_l = np.array([s.get("foot_l_z", np.nan) for s in series], dtype=float) \
+        if axis == "z" else np.array([s.get("foot_l_x", np.nan) for s in series], dtype=float)
+    ex_r = np.array([s.get("foot_r_z", np.nan) for s in series], dtype=float) \
+        if axis == "z" else np.array([s.get("foot_r_x", np.nan) for s in series], dtype=float)
+    lengths = []
+    for ex in (ex_l, ex_r):
+        fwd = body - ex
+        fwd = fwd[np.isfinite(fwd)]
+        if fwd.size < 8:
+            continue
+        span = float(np.percentile(fwd, 95) - np.percentile(fwd, 5))
+        if 0.02 < span < 1.2:          # reject noise and tracking jumps
+            lengths.append(span)
+    if lengths:
+        out["step_length_m"] = round(float(np.mean(lengths)), 2)
+        out["foot_excursion_m"] = [round(v, 2) for v in lengths]
+    else:
+        out["step_length_m"] = None
+    return out
+
 
 
 def plot_gait(series, fps, path):
     t = np.arange(len(series)) / max(fps, 1e-6)
     def a(k):
-        return np.array([s[k] for s in series], dtype=float)
-    fig, axs = plt.subplots(3, 1, figsize=(9, 8), sharex=True)
+        return np.array([s.get(k, np.nan) for s in series], dtype=float)
+    fwd_l = a("dist_m") - a("foot_l_z")
+    fwd_r = a("dist_m") - a("foot_r_z")
+    has_depth = bool(np.isfinite(fwd_l).sum() > 5)
+    rows = 4 if has_depth else 3
+    fig, axs = plt.subplots(rows, 1, figsize=(9, 2.6 * rows + 0.6), sharex=True)
     axs[0].plot(t, a("knee_l"), label="left knee")
     axs[0].plot(t, a("knee_r"), label="right knee")
     axs[0].set_ylabel("knee angle (deg)")
@@ -247,8 +428,14 @@ def plot_gait(series, fps, path):
     axs[2].plot(t, a("ankle_ly"), label="left ankle y")
     axs[2].plot(t, a("ankle_ry"), label="right ankle y")
     axs[2].set_ylabel("ankle y (norm)")
-    axs[2].set_xlabel("time (s)")
     axs[2].legend(loc="best")
+    if has_depth:
+        axs[3].plot(t, fwd_l, label="left foot fwd (m)")
+        axs[3].plot(t, fwd_r, label="right foot fwd (m)")
+        axs[3].plot(t, a("dist_m"), "--", color="#888", label="body distance (m)")
+        axs[3].set_ylabel("metres")
+        axs[3].legend(loc="best")
+    axs[-1].set_xlabel("time (s)")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -260,7 +447,8 @@ def run_capture(source, duration, fps):
         STATE.update(running=True, progress=0.0, error=None)
     STOP.clear()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    src = Source(source)
+    src = Source(source, depth=True)
+    depth_ok = 0
     series = []
     last_overlay = None
     start = time.time()
@@ -283,6 +471,11 @@ def run_capture(source, duration, fps):
                     lms = res.pose_landmarks[0]
                     row = extract(lms, w, h)
                     if row is not None:
+                        depth, K = src.read_depth()
+                        if depth is not None and K is not None:
+                            add_depth(row, depth, K, src.depth_scale)
+                            if np.isfinite(row.get("dist_m", np.nan)):
+                                depth_ok += 1
                         series.append(row)
                         last_overlay = draw_overlay(frame, lms)
                 with LOCK:
@@ -391,6 +584,13 @@ def init_db():
             created_at TEXT
         )
         """)
+        # Migrate older databases that predate the D455 depth metrics.
+        cols = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+        for name, typ in (("distance_m", "REAL"),
+                          ("step_length_m", "REAL"),
+                          ("depth", "INTEGER")):
+            if name not in cols:
+                db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {typ}")
         db.commit()
 
 
@@ -406,12 +606,19 @@ def make_report(m):
     ts = float(m.get("trunk_std_deg", 0) or 0)
     sway = float(m.get("sway_norm", 0) or 0)
     step_norm = float(m.get("step_length_norm", 0) or 0)
+    dist = m.get("distance_m")
+    dist = float(dist) if isinstance(dist, (int, float)) else None
+    step_m = m.get("step_length_m")
+    step_m = float(step_m) if isinstance(step_m, (int, float)) else None
+    depth_used = bool(m.get("depth_used"))
 
     if steps < 2 or dur < 2.5:
         report = (
             "本次采集没有形成连续步行，可能是站立、转身或人体未完整入镜。"
             "这组数据不能用于步态风险判断，建议让老人自然走 5–10 步后重新采集。"
         )
+        if dist is not None:
+            report += f"\n深度测得站位距离约 {dist:.1f} 米。"
         tips = [
             "请站在距机器人 2–3 米处，保证头、髋、膝、踝都在画面内。",
             "采集时自然连续走 5–10 步，不要只站着或转身。",
@@ -436,7 +643,13 @@ def make_report(m):
         findings.append("躯干左右摆动较大")
     if sway > 0.08:
         findings.append("重心左右摆动偏大")
-    if step_norm < 0.8:
+    # Prefer the metric step length when depth is available.
+    if step_m is not None:
+        if step_m < 0.35:
+            findings.append("步幅偏小")
+        elif step_m > 0.95:
+            findings.append("步幅偏大")
+    elif step_norm < 0.8:
         findings.append("步幅偏小")
 
     if not findings:
@@ -452,9 +665,20 @@ def make_report(m):
     report = (
         f"本次有效采集 {dur:.1f} 秒、{steps} 步，步频约 {cad:.0f} 步/分；"
         f"左右膝平均活动范围约 {kr:.1f}°，膝对称性偏差 {sym:.1f}%。\n"
-        f"观察结果：{summary}\n"
-        "说明：这是基于 RGB 2D 姿态的筛查结果，不是医学诊断。"
     )
+    if depth_used and dist is not None:
+        report += f"站位距离约 {dist:.1f} 米。\n"
+    if step_m is not None:
+        report += f"估算步长约 {step_m:.2f} 米（D455 深度换算，供趋势参考）。\n"
+    report += (
+        f"观察结果：{summary}\n"
+        "说明：这是基于 RGB 2D 姿态 + 深度估算的筛查结果，不是医学诊断。"
+    )
+    if depth_used and dist is not None and not (1.2 <= dist <= 4.5):
+        report += (
+            f"\n注意：本次站位距离 {dist:.1f} 米，超出建议的 2–3 米，"
+            "步长与角度可能偏差，建议调整位置后复测。"
+        )
     tips = []
     if cad < 60:
         tips.append("每天分次慢走 10–20 分钟，先热身，量力而行。")
@@ -462,7 +686,7 @@ def make_report(m):
         tips.append("可做扶墙单腿站立、重心转移等平衡练习，旁边一定要有人保护。")
     if kr < 10:
         tips.append("做温和的膝关节屈伸和股四头肌拉伸，避免久坐后突然起身。")
-    if step_norm < 0.8:
+    if (step_m is not None and step_m < 0.35) or (step_m is None and step_norm < 0.8):
         tips.append("步幅不要刻意迈大，先求稳，再逐步增加步幅。")
     tips.append("如出现膝髋疼痛、头晕、胸闷或走路突然不稳，请及时就医。")
     tips.append("建议每周在相同位置复测一次，观察趋势而不是单次结果。")
@@ -474,14 +698,17 @@ def save_session(ts, metrics, report, tips, risk, pose, gait, json_name):
         cur = db.execute(
             """INSERT OR REPLACE INTO sessions
                (ts, duration, frames, step_count, cadence, symmetry, risk,
-                metrics, report, tips, pose, gait, json, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                metrics, report, tips, pose, gait, json, created_at,
+                distance_m, step_length_m, depth)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ts, metrics.get("duration_s"), metrics.get("frames"),
              metrics.get("step_count"), metrics.get("cadence_spm"),
              metrics.get("knee_symmetry_pct"), risk,
              json.dumps(metrics, ensure_ascii=False),
              report, json.dumps(tips, ensure_ascii=False),
-             pose, gait, json_name, datetime.now().isoformat(timespec="seconds")),
+             pose, gait, json_name, datetime.now().isoformat(timespec="seconds"),
+             metrics.get("distance_m"), metrics.get("step_length_m"),
+             1 if metrics.get("depth_used") else 0),
         )
         db.commit()
         return cur.lastrowid
@@ -596,7 +823,7 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
 .hist td{font-size:12px}
 .hist button{font-size:12px;padding:5px 8px;margin:0}
 </style></head><body>
-<h1>固定健康站 <small>· 机器人停稳 + RGB + MediaPipe</small></h1>
+<h1>固定健康站 <small>· 机器人停稳 + D455 彩色/深度 + MediaPipe</small></h1>
 <div class="grid">
   <div class="card">
     <button class="prep" onclick="prepare()">准备（停车）</button>
@@ -605,7 +832,7 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
     <div id="bar"><div id="fill"></div></div>
     <div id="msg">请让老人站在头部相机前，露出全身；距离 2–3 米。</div>
     <img id="live" src="http://127.0.0.1:8080/stream/head">
-    <small>实时头部相机 /dev/video0</small>
+    <small>实时头部相机 D455（彩色 + 对齐深度）</small>
     <table id="metrics">
       <tr><td>状态</td><td id="m_status">未开始</td></tr>
       <tr><td>步数</td><td id="m_steps">-</td></tr>
@@ -614,6 +841,8 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
       <tr><td>左/右膝活动范围</td><td id="m_krange">-</td></tr>
       <tr><td>躯干平均/波动角</td><td id="m_trunk">-</td></tr>
       <tr><td>膝对称性</td><td id="m_sym">-</td></tr>
+      <tr><td>站位距离（米，深度）</td><td id="m_dist">-</td></tr>
+      <tr><td>步长（米，深度估算）</td><td id="m_step_m">-</td></tr>
       <tr><td>步长（归一化）</td><td id="m_step">-</td></tr>
       <tr><td>重心摆动（归一化）</td><td id="m_sway">-</td></tr>
     </table>
@@ -657,6 +886,8 @@ function renderLatest(l){
   set('m_krange',m.knee_left_range_deg+' / '+m.knee_right_range_deg+' °');
   set('m_trunk',m.trunk_mean_deg+' / '+m.trunk_std_deg+' °');
   set('m_sym',m.knee_symmetry_pct+' %');
+  set('m_dist', (m.distance_m!==null && m.distance_m!==undefined) ? m.distance_m+' m' : '无深度');
+  set('m_step_m', (m.step_length_m!==null && m.step_length_m!==undefined) ? m.step_length_m+' m' : '无深度');
   set('m_step',m.step_length_norm);
   set('m_sway',m.sway_norm);
   if(l.risk) document.getElementById('risk').textContent='风险等级：'+l.risk;

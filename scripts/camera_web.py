@@ -9,12 +9,14 @@ Only one process can own the D455 at a time: stop LeRobot camera connections
 before starting this server, or use a separate process for robot recording.
 """
 import argparse
+import io
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import cv2
+import numpy as np
 
 try:
     import pyrealsense2 as rs
@@ -84,10 +86,14 @@ class RealSenseHead:
         self.height = height
         self.fps = fps
         self.pipe = None
+        self.profile = None
         self.colorizer = rs.colorizer() if rs is not None else None
         self.align = rs.align(rs.stream.color) if rs is not None else None
         self.jpeg = None
         self.depth_jpeg = None
+        self.depth = None          # raw aligned depth, uint16 millimetres
+        self.depth_scale = 0.001   # metres per depth unit
+        self.K = None              # (fx, fy, cx, cy) of the aligned color stream
         self.error = None
         self.lock = threading.Lock()
         self.stop = False
@@ -102,7 +108,15 @@ class RealSenseHead:
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps)
         cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, self.fps)
         self.pipe = rs.pipeline()
-        self.pipe.start(cfg)
+        self.profile = self.pipe.start(cfg)
+        # Intrinsics of the colour stream; depth is aligned onto it.
+        intr = self.profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self.K = (float(intr.fx), float(intr.fy), float(intr.ppx), float(intr.ppy))
+        try:
+            self.depth_scale = float(
+                self.profile.get_device().first_depth_sensor().get_depth_scale())
+        except Exception:
+            self.depth_scale = 0.001
 
     def loop(self):
         while not self.stop:
@@ -124,6 +138,10 @@ class RealSenseHead:
                         with self.lock:
                             self.jpeg = buf.tobytes()
                 if depth:
+                    # Keep the raw aligned depth so clients can convert pixels to
+                    # metres; the colourised JPEG is only for the web view.
+                    with self.lock:
+                        self.depth = self._img(depth).copy()
                     colored = self.colorizer.colorize(depth)
                     d = self._img(colored)
                     ok, buf = cv2.imencode(".jpg", d, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -153,6 +171,31 @@ class RealSenseHead:
     def snapshot_depth(self):
         with self.lock:
             return self.depth_jpeg
+
+    def snapshot_npz(self):
+        """Colour JPEG + aligned depth + intrinsics in one compressed npz.
+
+        Used by the health station so a single HTTP request returns both the
+        image and the metric depth needed for real (metre) step length.
+        """
+        with self.lock:
+            jpeg = self.jpeg
+            depth = None if self.depth is None else self.depth.copy()
+            K = self.K
+            scale = self.depth_scale
+        if jpeg is None or depth is None or K is None:
+            return None
+        buf = io.BytesIO()
+        np.savez_compressed(
+            buf,
+            color_jpeg=np.frombuffer(jpeg, dtype=np.uint8),
+            depth=np.ascontiguousarray(depth, dtype=np.uint16),
+            fx=K[0], fy=K[1], cx=K[2], cy=K[3],
+            depth_scale=scale,
+            width=self.width,
+            height=self.height,
+        )
+        return buf.getvalue()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -199,6 +242,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             self._stream(cam.snapshot, cam.fps)
+            return
+        if path == "/snapshot/head_npz":
+            blob = self.head.snapshot_npz() if self.head else None
+            if blob is None:
+                self.send_error(503)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
             return
         if path == "/snapshot/head_depth":
             jpeg = self.head.snapshot_depth() if self.head else None
