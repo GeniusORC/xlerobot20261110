@@ -33,6 +33,8 @@ VIDEO_W, VIDEO_H = 720, 540
 
 
 def resolve_source(source: str) -> str:
+    if source.startswith("realsense:"):
+        return source
     if not source.startswith("/dev/"):
         return source
     cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
@@ -307,7 +309,7 @@ class App:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="/dev/video0")
+    ap.add_argument("--source", default="http://127.0.0.1:8080/snapshot/head")
     ap.add_argument("--robot-api", default=hs.ROBOT_API)
     ap.add_argument("--duration", type=float, default=10.0)
     args = ap.parse_args()

@@ -80,8 +80,27 @@ class Source:
     def __init__(self, source):
         self.source = source
         self.cap = None
+        self.rs_pipe = None
+        if source.startswith("realsense:"):
+            import pyrealsense2 as rs
+            serial = source.split(":", 1)[1].strip()
+            cfg = rs.config()
+            if serial:
+                cfg.enable_device(serial)
+            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            self.rs_pipe = rs.pipeline()
+            self.rs_pipe.start(cfg)
 
     def read(self):
+        if self.rs_pipe is not None:
+            try:
+                frames = self.rs_pipe.wait_for_frames()
+                color = frames.get_color_frame()
+                if color:
+                    return np.asanyarray(color.get_data())
+            except Exception:
+                return None
+            return None
         if self.source.startswith("http://") or self.source.startswith("https://"):
             try:
                 r = requests.get(self.source, timeout=2)

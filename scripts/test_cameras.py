@@ -24,7 +24,8 @@ def main() -> int:
     )
     print("configured cameras:")
     for name, cam in cfg.cameras.items():
-        print(f"  {name}: {cam.index_or_path} {cam.width}x{cam.height}@{cam.fps}")
+        dev = getattr(cam, "index_or_path", getattr(cam, "serial_number_or_name", "?"))
+        print(f"  {name}: {dev} {cam.width}x{cam.height}@{cam.fps}")
 
     cams = make_cameras_from_configs(cfg.cameras)
     os.makedirs("data", exist_ok=True)
@@ -52,6 +53,12 @@ def main() -> int:
             print(f"{name}: {frame.shape} dtype={frame.dtype} "
                   f"mean={float(np.mean(frame)):.1f} sharpness={sharpness:.1f}")
             print(f"  saved data/cam_{name}.png (RGB->BGR for OpenCV)")
+            if name == "head" and hasattr(cams[name], "async_read_depth"):
+                depth = cams[name].async_read_depth()
+                print(f"  head depth: {depth.shape} {depth.dtype} "
+                      f"min={int(depth.min())} max={int(depth.max())}")
+                cv2.imwrite("data/cam_head_depth.png",
+                            (depth.squeeze() / max(1, int(depth.max())) * 255).astype("uint8"))
         print(f"20 rounds in {dt:.2f}s -> {20 / dt:.1f} rounds/s (3 cameras)")
         return 0
     finally:

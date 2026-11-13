@@ -301,14 +301,14 @@ L_actual = wheel_arc_difference / actual_body_angle_rad
 
 ### RGB camera configuration
 
-The D455 is not used for now. The three robot RGB cameras are configured in
+The D455 replaced the old head camera. The three robot cameras are configured in
 `config_xlerobot_2wheels.py` (patch `0002-configure-rgb-cameras.patch`):
 
 | Name | Device | Resolution | Notes |
 |---|---|---|---|
-| `left_wrist` | `/dev/video6` | 640x480@30 | left wrist (sharp) |
-| `right_wrist` | `/dev/video2` | 640x480@30 | right wrist (soft) |
-| `head` | `/dev/video0` | 640x480@30 | head (blurry, needs focus) |
+| `left_wrist` | `/dev/video2` | 640x480@30 | left wrist |
+| `right_wrist` | `/dev/video0` | 640x480@30 | right wrist |
+| `head` | D455 serial `333422300185` | 640x480@30 | RealSense SDK, color + depth |
 
 Verify all three simultaneously:
 
@@ -321,20 +321,24 @@ Verified: all three open together, `get_observation()` returns
 `left_wrist`, `right_wrist`, `head` as `(480, 640, 3) uint8`, and 20 rounds of
 three frames take ~0.75 s (~26.5 rounds/s total).
 
-Camera labels were corrected after a physical check: `/dev/video0` is the head,
-`/dev/video6` is the left wrist, and `/dev/video2` is the right wrist.
+Device nodes shifted after the D455 replacement: the left wrist is now
+`/dev/video2`, the right wrist is `/dev/video0`, and the D455 is accessed through
+the RealSense SDK rather than a `/dev/video*` node.
 
-Measured sharpness (Laplacian variance) with the corrected mapping:
+Measured with `scripts/test_cameras.py`:
 
-- left wrist `/dev/video6`: ~462 (sharp)
-- right wrist `/dev/video2`: ~32 (soft)
-- head `/dev/video0`: ~15 (blurry)
+- left wrist `/dev/video2`: sharpness ~152
+- right wrist `/dev/video0`: sharpness ~69
+- D455 head: sharpness ~825, color `(480,640,3)`, aligned depth
+  `(480,640,1) uint16` (max ~7.4 m)
+- three-camera round: ~26.9 rounds/s
 
-The head camera is currently the blurry one. These UVC cameras expose no V4L2
-focus control, so clean the lens / remove any protective film and turn the
-manual focus ring to the working distance. Without D455 depth/IMU, navigation
-and gait work must use monocular vision and wheel odometry; the 90° test angle
-must come from a floor/phone measurement.
+The D455 color and aligned depth are streamed by `camera_web.py` at
+`/snapshot/head` and `/snapshot/head_depth` (also `/stream/head` and
+`/stream/head_depth`). Only one process can own the D455 at a time: stop
+`camera_web.py` before using the RealSense head camera inside LeRobot
+teleoperation/recording, and stop LeRobot camera connections before starting
+`camera_web.py`.
 
 ## 9. Direction check and short validation
 
@@ -542,3 +546,41 @@ Table `messages`:
 a restart. The initial greeting is only inserted when the database is empty.
 Verified with DeepSeek: the user message and the `engine: "llm"` reply were
 written, and both reappeared after restarting the service.
+
+## 18. D455 head camera replacement
+
+The D455 is configured as the head camera with the LeRobot RealSense backend:
+
+```python
+"head": RealSenseCameraConfig(
+    serial_number_or_name="333422300185",
+    fps=30,
+    width=640,
+    height=480,
+    color_mode=ColorMode.RGB,
+    rotation=Cv2Rotation.NO_ROTATION,
+    use_depth=True,
+)
+```
+
+The wrist cameras moved to `/dev/video2` (left) and `/dev/video0` (right) after
+the old head camera was removed. The D455 is not opened as a `/dev/video*` node
+by the robot configuration; it uses the RealSense SDK.
+
+`camera_web.py` now streams D455 color and aligned depth:
+
+```text
+http://127.0.0.1:8080/stream/head
+http://127.0.0.1:8080/stream/head_depth
+http://127.0.0.1:8080/snapshot/head
+http://127.0.0.1:8080/snapshot/head_depth
+```
+
+The health station uses `/snapshot/head`. The desktop health app can use the
+D455 directly with:
+
+```bash
+python scripts/health_station_app.py --source realsense:333422300185
+```
+
+In that mode, stop `camera_web.py` first (single D455 owner).

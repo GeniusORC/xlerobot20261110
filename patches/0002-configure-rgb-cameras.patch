@@ -1,6 +1,6 @@
 --- a/software/src/robots/xlerobot_2wheels/config_xlerobot_2wheels.py
 +++ b/software/src/robots/xlerobot_2wheels/config_xlerobot_2wheels.py
-@@ -23,27 +23,27 @@
+@@ -23,27 +23,32 @@
  
  def xlerobot_2wheels_cameras_config() -> dict[str, CameraConfig]:
      return {
@@ -25,26 +25,31 @@
 -        #     rotation=Cv2Rotation.NO_ROTATION,
 -        #     use_depth=True
 -        # ),
++        # Wrist cameras shifted device nodes after the D455 replaced the old
++        # head camera: left wrist is now video2, right wrist is video0.
 +        "left_wrist": OpenCVCameraConfig(
-+            index_or_path="/dev/video6",
-+            fps=30,
-+            width=640,
-+            height=480,
-+            rotation=Cv2Rotation.NO_ROTATION,
-+        ),
-+        "right_wrist": OpenCVCameraConfig(
 +            index_or_path="/dev/video2",
 +            fps=30,
 +            width=640,
 +            height=480,
 +            rotation=Cv2Rotation.NO_ROTATION,
 +        ),
-+        "head": OpenCVCameraConfig(
++        "right_wrist": OpenCVCameraConfig(
 +            index_or_path="/dev/video0",
 +            fps=30,
 +            width=640,
 +            height=480,
 +            rotation=Cv2Rotation.NO_ROTATION,
++        ),
++        # D455 head camera. Use the RealSense SDK, not a /dev/video* node.
++        "head": RealSenseCameraConfig(
++            serial_number_or_name="333422300185",
++            fps=30,
++            width=640,
++            height=480,
++            color_mode=ColorMode.RGB,
++            rotation=Cv2Rotation.NO_ROTATION,
++            use_depth=True,
 +        ),
      }
  

@@ -66,8 +66,10 @@ ros2 launch realsense2_camera rs_launch.py \
 - This build drives backwards for positive `x.vel`. The local clone is patched
   with `INVERT_LINEAR_DIRECTION = True` (x only, rotation unchanged); re-apply
   with `./scripts/apply_xlerobot_patches.sh`.
-- D455 is temporarily unused. RGB mapping: head `/dev/video0` (blurry, needs
-  focus), left wrist `/dev/video6`, right wrist `/dev/video2`.
+- D455 is now the head camera (serial `333422300185`, color + aligned depth via
+  RealSense SDK). Wrist mapping changed after the swap: left `/dev/video2`,
+  right `/dev/video0`. Only one process can own the D455 at a time
+  (`camera_web.py` vs. LeRobot camera connections).
 - Motor-bus mapping (1 Mbaud):
   - `/dev/xlerobot_serial_b` → IDs 1–8 → **bus1** (left arm + head), use as `port1`
   - `/dev/xlerobot_serial_a` → IDs 1–6, 9, 10 → **bus2** (right arm + 2 wheels), use as `port2`
