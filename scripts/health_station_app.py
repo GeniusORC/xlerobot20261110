@@ -97,6 +97,8 @@ class App:
         self.stop_event = threading.Event()
         self.latest = None
         self.photo = None
+        self.follow_on = bool(getattr(args, "follow", False))
+        self.follow_distance = float(getattr(args, "follow_distance", 1.0))
 
         root.title("XLeRobot 固定健康站")
         root.geometry("1220x780")
@@ -142,6 +144,27 @@ class App:
                                   bg="#d33", fg="white", font=("Sans", 12),
                                   width=8)
         self.btn_stop.pack(side="left")
+
+        follow = tk.Frame(right, bg="#1d1d1f")
+        follow.pack(fill="x", pady=(0, 6))
+        self.follow_var = tk.BooleanVar(value=self.follow_on)
+        tk.Checkbutton(follow, text="采集时跟随", variable=self.follow_var,
+                       command=self.on_follow_toggle, bg="#1d1d1f", fg="#eee",
+                       selectcolor="#333", activebackground="#1d1d1f",
+                       activeforeground="#fff",
+                       font=("Sans", 11)).pack(side="left")
+        tk.Label(follow, text="目标距离", fg="#aaa", bg="#1d1d1f",
+                 font=("Sans", 10)).pack(side="left", padx=(12, 4))
+        self.follow_dist_var = tk.StringVar(value=f"{self.follow_distance:.1f}")
+        tk.Spinbox(follow, from_=0.5, to=3.0, increment=0.1, width=5,
+                   textvariable=self.follow_dist_var,
+                   font=("Sans", 10)).pack(side="left")
+        tk.Label(follow, text="m", fg="#aaa", bg="#1d1d1f",
+                 font=("Sans", 10)).pack(side="left", padx=(3, 0))
+        self.follow_status = tk.Label(right, text="", fg="#9cf", bg="#1d1d1f",
+                                      font=("Sans", 9), anchor="w",
+                                      justify="left", wraplength=360)
+        self.follow_status.pack(fill="x", pady=(0, 4))
 
         self.metrics = {}
         names = [
@@ -223,9 +246,27 @@ class App:
         self.progress["value"] = 0
         self.btn_start.config(state="disabled")
         self.btn_prepare.config(state="disabled")
-        self.set_status("采集中：请自然走几步，保持全身在画面内...")
+        self.follow_on = bool(self.follow_var.get())
+        try:
+            self.follow_distance = float(self.follow_dist_var.get())
+        except ValueError:
+            self.follow_distance = 1.0
+        self.follow_distance = min(3.0, max(0.5, self.follow_distance))
+        if self.follow_on:
+            self.set_status("采集中：底盘保持站位，请自然走几步...")
+        else:
+            self.set_status("采集中：请自然走几步，保持全身在画面内...")
         self.stop_robot()
         threading.Thread(target=self.capture_loop, daemon=True).start()
+
+    def on_follow_toggle(self):
+        self.follow_on = bool(self.follow_var.get())
+        if not self.follow_on:
+            try:
+                hs.BaseFollower(self.args.robot_api).stop()
+            except Exception:
+                pass
+            self.follow_status.config(text="采集时跟随：关")
 
     def stop(self):
         self.stop_event.set()
@@ -237,12 +278,19 @@ class App:
         series = []
         last_overlay = None
         start = time.time()
+        follower = None
+        if self.follow_on:
+            follower = hs.BaseFollower(self.args.robot_api)
+            follower.reset()
+            msg = f"跟随准备中（目标 {self.follow_distance:.1f} m）"
+            self.root.after(0, lambda t=msg: self.follow_status.config(text=t))
         try:
             lm = hs.make_landmarker()
             while not self.stop_event.is_set():
                 elapsed = time.time() - start
                 if elapsed >= self.args.duration:
                     break
+                dist_now = None
                 frame, depth, K, scale = self.grabber.latest_with_depth()
                 if frame is None:
                     time.sleep(0.05)
@@ -257,11 +305,36 @@ class App:
                     if row is not None:
                         if depth is not None and K is not None:
                             hs.add_depth(row, depth, K, scale)
+                            if np.isfinite(row.get("dist_m", np.nan)):
+                                dist_now = float(row["dist_m"])
+                                if (follower is not None
+                                        and follower.target is None):
+                                    dmin = hs.min_full_body_distance(
+                                        row, dist_now, K[1], h)
+                                    if dmin is None:
+                                        msg = "还没量到身高，暂不跟随"
+                                        self.root.after(
+                                            0, lambda t=msg:
+                                            self.follow_status.config(text=t))
+                                    else:
+                                        eff = max(self.follow_distance, dmin)
+                                        follower.target = float(eff)
+                                        if eff > self.follow_distance + 0.03:
+                                            msg = (f"跟随 {eff:.1f} m："
+                                                   f"{self.follow_distance:.1f} m "
+                                                   f"时全身会出框，已自动拉远")
+                                        else:
+                                            msg = f"跟随 {eff:.1f} m"
+                                        self.root.after(
+                                            0, lambda t=msg:
+                                            self.follow_status.config(text=t))
                         series.append(row)
                         last_overlay = hs.draw_overlay(frame, lms)
                         self.root.after(0, self.show_frame, last_overlay)
                 else:
                     self.root.after(0, self.show_frame, frame)
+                if follower is not None:
+                    follower.update(dist_now)
                 pct = min(100, int(elapsed / self.args.duration * 100))
                 self.root.after(0, lambda p=pct: self.progress.configure(value=p))
                 time.sleep(0.1)
@@ -297,6 +370,10 @@ class App:
             traceback.print_exc()
             self.root.after(0, self.finish_error, f"{type(e).__name__}: {e}")
         finally:
+            if follower is not None:
+                follower.stop()
+                self.root.after(0, lambda: self.follow_status.config(
+                    text="采集结束，底盘已停"))
             if lm is not None:
                 try:
                     lm.close()
@@ -345,6 +422,11 @@ def main():
     ap.add_argument("--source", default="http://127.0.0.1:8080/snapshot/head")
     ap.add_argument("--robot-api", default=hs.ROBOT_API)
     ap.add_argument("--duration", type=float, default=10.0)
+    ap.add_argument("--follow", action="store_true",
+                    help="start with base following enabled")
+    ap.add_argument("--follow-distance", type=float, default=1.0,
+                    help="requested standoff while capturing (clamped so the "
+                         "full body stays in frame)")
     args = ap.parse_args()
     hs.init_db()
     root = tk.Tk()

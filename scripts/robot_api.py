@@ -11,6 +11,7 @@ Endpoints:
   GET  /head                        head pan/tilt (normalized -100..100)
   POST /head      {"pan":..,"tilt":..} or {"dpan":..,"dtilt":..} or {"center":true}
   POST /drive     {"x":m/s,"theta":deg/s,"duration":s}  bounded fine positioning
+  POST /velocity  {"x":..,"theta":..} short-lease continuous following
   POST /estop
 """
 import argparse
@@ -50,6 +51,12 @@ BUS_LOCK = threading.Lock()
 PAN_MOTOR, TILT_MOTOR = "head_motor_1", "head_motor_2"
 PAN_LIMIT = (-70.0, 70.0)
 TILT_LIMIT = (-30.0, 30.0)
+
+# Short-lease velocity command used by continuous following. The base keeps
+# moving only while the health station keeps refreshing this lease. Approaching
+# a person is slower than retreating from one.
+VEL = {"x": 0.0, "theta": 0.0, "lease": 0.0}
+VEL_LIMIT = (-0.20, 0.12)
 
 
 def set_state(**kwargs):
@@ -129,6 +136,25 @@ def _move(x: float, theta: float, duration: float, message: str):
         set_state(busy=False, message=f"动作失败: {e}")
 
 
+def _apply_velocity():
+    """Apply the leased velocity, or stop when it expires. True if applied."""
+    if not VEL["lease"]:
+        return False
+    if STOP_EVENT.is_set() or time.time() > VEL["lease"]:
+        VEL["lease"] = 0.0
+        try:
+            ROBOT.stop_base()
+        except Exception:
+            pass
+        return False
+    try:
+        _rmw(ROBOT.send_action, {"x.vel": VEL["x"], "theta.vel": VEL["theta"]})
+        return True
+    except Exception:
+        VEL["lease"] = 0.0
+        return False
+
+
 def _drive(x: float, theta: float, duration: float):
     """Bounded fine positioning used by the health station auto-framing."""
     x = float(np.clip(x, -0.08, 0.08))
@@ -187,9 +213,21 @@ def worker():
     while not SHUTDOWN:
         intent = None
         try:
-            intent = COMMANDS.get(timeout=0.2)
+            intent = COMMANDS.get(timeout=0.05)
         except queue.Empty:
             pass
+
+        if intent is None:
+            if _apply_velocity():
+                continue
+            # Idle: make sure the base is stopped.
+            if time.time() - last > 0.5:
+                try:
+                    ROBOT.stop_base()
+                except Exception:
+                    pass
+                last = time.time()
+            continue
 
         if intent == "stop":
             _stop()
@@ -249,14 +287,6 @@ def worker():
             _look_at_person()
             continue
 
-        # Idle: make sure the base is stopped.
-        if time.time() - last > 0.5:
-            try:
-                ROBOT.stop_base()
-            except Exception:
-                pass
-            last = time.time()
-
 
 @app.get("/status")
 def status():
@@ -313,9 +343,34 @@ def drive():
     return jsonify({"queued": "drive", **cmd})
 
 
+@app.post("/velocity")
+def velocity():
+    """Short-lease base velocity for continuous following.
+
+    The base stops by itself if this is not refreshed within 0.6 s, so a
+    crashed client cannot leave the robot driving.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    if data.get("stop"):
+        VEL["lease"] = 0.0
+        VEL["x"] = VEL["theta"] = 0.0
+        COMMANDS.put("stop")
+        return jsonify({"ok": True, "stopped": True})
+    x = float(np.clip(float(data.get("x", 0.0)), *VEL_LIMIT))
+    theta = float(np.clip(float(data.get("theta", 0.0)), -25.0, 25.0))
+    STOP_EVENT.clear()
+    VEL.update(x=x, theta=theta, lease=time.time() + 0.6)
+    return jsonify({"ok": True, "x": x, "theta": theta,
+                    "lease_ms": 600})
+
+
 @app.post("/estop")
 def estop():
     STOP_EVENT.set()
+    VEL["lease"] = 0.0
+    VEL["x"] = VEL["theta"] = 0.0
     if ROBOT is not None:
         try:
             ROBOT.stop_base()

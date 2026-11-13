@@ -749,12 +749,11 @@ and 8 on bus1.
 |---|---|---|---|
 | Idle + 头部跟随 | still | pans/tilts to keep the person centred | live distance shown |
 | 自动取景 | drives to 2.6 ± 0.45 m | aims at the person | full-body framing |
-| 采集 | **still** | follows, keeps the body framed | body-frame step length |
+| 采集 | still | follows, keeps the body framed | body-frame step length |
+| 采集 + 采集时跟随 | holds the standoff (see §21) | follows | body-frame step length |
 
-The base deliberately does not move during a capture: cadence and step
-detection use image-space ankle motion, and a moving base adds a trend that
-makes step counting noisier. The head may move freely. Run 自动取景 first, then
-start the capture.
+Without following, the base deliberately stays still during a capture. Run
+自动取景 first, then start the capture; §21 adds optional base following.
 
 The tracker closes the loop on pixels, so no motor-angle calibration is
 needed. If the pan direction is inverted on a given build, it detects the error
@@ -769,3 +768,136 @@ python scripts/robot_api.py --port 8090      # power the robot first
 python scripts/test_head.py                  # read-only
 python scripts/test_head.py --move           # 5-unit nudge, then re-centre
 ```
+
+## 21. Following during capture ("采集时跟随")
+
+Requested behaviour: during a capture the base should also follow the person
+and hold a fixed standoff (1 m), instead of standing still. Two things had to
+be fixed first: step counting, and the fact that a full adult does not fit in
+the frame at 1 m.
+
+### 21.1 The 1 m target is physically impossible, so it is clamped
+
+The D455 colour stream is 640x480 with a vertical FOV of about 57-63 deg, so at
+1 m it sees roughly 1.1-1.2 m of height. A 1.7 m adult therefore cannot be
+fully framed at 1 m, and `extract()` deliberately rejects partial bodies.
+
+The station measures the person's height from the pose + depth and derives the
+closest distance that still keeps the whole body in frame:
+
+```text
+body_h_m = (v_ankle - v_nose) * depth / fy * 1.08     # nose is below head top
+d_min    = body_h_m * fy / (0.85 * frame_h)
+```
+
+`0.85` leaves a 7-8 % margin so the ankles are not clipped. Examples:
+
+| Person height | Requested | Effective standoff |
+|---|---|---|
+| 1.82 m | 1.0 m | 1.72 m |
+| 1.42 m | 1.0 m | 1.53 m |
+
+The requested value is stored in `follow_distance`, the clamped value in
+`follow_target`, and the UI says when it pulled the robot back:
+
+> 跟随 1.5 m：1.0 m 时全身会出框，已自动拉远以保证准度
+
+Requests are clamped to at least the person's `d_min`, never above it. If the
+height cannot be measured the robot does **not** move at all until a valid
+full-body frame arrives.
+
+### 21.2 Step counting no longer uses image space
+
+The old detector took peaks of the ankle image height (`ankle_ly`). A base that
+moves adds a trend to that signal, which corrupts the cadence. The detector now
+prefers the body-frame foot excursion `bf_l` / `bf_r` (metres, §20.1), which is
+already invariant to camera motion:
+
+```text
+step_count = peaks(bf_l) + peaks(bf_r)   # prominence 0.04 m, 0.35 s gap
+step_detector = "depth_body_frame"
+```
+
+The image-space detector remains only as a no-depth fallback.
+
+### 21.3 Short-lease velocity endpoint
+
+Continuous following needs a velocity that persists between HTTP calls, but a
+dead client must never leave the base driving.
+
+```text
+POST /velocity {"x": m/s, "theta": deg/s}    -> lease 0.6 s
+POST /velocity {"stop": true}                -> immediate stop
+```
+
+`robot_api.py` applies the value in its 20 Hz worker loop (queue timeout
+0.05 s) and stops the base as soon as the lease expires, `POST /estop` is
+called, or a normal command arrives. Limits: `x` in [-0.20, +0.12] m/s,
+`theta` in ±25 deg/s. Approaching a person is deliberately slower than
+retreating.
+
+### 21.4 Controller and safety envelope
+
+```text
+deadband = 0.15 m
+speed    = clip(0.30 * (dist - target), -0.20, +0.12) m/s
+```
+
+| Condition | Action |
+|---|---|
+| target not measured yet | no motion |
+| person not detected | stop in the same frame |
+| `dist < 0.60 m` | retreat at 0.20 m/s |
+| forward request while `dist < 0.85 m` | refused |
+| capture ends / `/api/stop` | `{"stop": true}` |
+
+### 21.5 Test results
+
+`scripts/test_metric_camera_motion.py` now simulates three cases: a static
+camera, a panning head with sway, and a panning head **plus a base that dollies
+to hold the standoff**. Ground truth step length 0.59 m, 24 steps:
+
+```text
+lateral                body   cam-axis  steps  detector
+  static camera        0.59 m   0.50     24    depth_body_frame
+  panning head         0.59 m   0.46     24    depth_body_frame
+  head + base follow   0.59 m   0.43     24    depth_body_frame
+
+towards
+  static camera        0.59 m   0.59     24    depth_body_frame
+  panning head         0.59 m   0.59     24    depth_body_frame
+  head + base follow   0.59 m   0.59     24    depth_body_frame
+```
+
+Step length error stays at 0.001 m and the step count stays at 24 while the
+base drives; the old camera-axis estimate degrades to 0.43 m.
+
+`scripts/test_health_depth.py` also checks the controller: no motion before a
+height is measured, approach when too far, idle inside the deadband, retreat
+when too close, stop when the person is lost, and the 0.85 m forward floor.
+
+An end-to-end run of the real `run_capture()` with a synthetic camera confirmed
+that a requested 1.0 m is raised to 1.53 m, the base is driven, and `stop` is
+sent when the capture ends.
+
+### 21.6 How to use
+
+```bash
+source scripts/env.sh voice
+python scripts/health_station_web.py --port 8084 --follow --follow-distance 1.0
+```
+
+or in the UI: set **目标距离** and press **采集时跟随**, then **开始采集 10 秒**.
+The button shows the effective standoff (e.g. `1.5 m`), not the requested one.
+The Tk desktop app (`health_station_app.py`) has the same **采集时跟随** checkbox
+and **目标距离** spinbox, plus the matching `--follow` / `--follow-distance`
+flags.
+
+Recommended sequence:
+
+1. Stand 2-3 m away with the full body visible.
+2. Press **自动取景** so the base reaches the working distance and the head
+   aims at you.
+3. Press **采集时跟随**, then **开始采集 10 s** and walk naturally.
+4. The base keeps the standoff; if you walk toward it, it backs away at up to
+   0.2 m/s. Remove obstacles behind the robot first — there is no rear sensor.

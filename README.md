@@ -32,9 +32,10 @@ The robot stops, the head D455 captures a full-body walk (colour + aligned
 depth), MediaPipe extracts 2D pose, and the result includes a pose screenshot,
 gait curves and metrics JSON under `data/health/`. With depth, the report also
 gives the standing distance and the step length in **metres**; the head can
-follow the person and the base can drive itself to the 2–3 m working distance
-without losing metric accuracy. The app is also in the desktop application menu
-as **XLeRobot 固定健康站**.
+follow the person, and during a capture the base can hold a fixed standoff
+(`采集时跟随`, requested 1 m, automatically pulled back to the closest distance
+that keeps the full body in frame) without losing metric accuracy. The app is
+also in the desktop application menu as **XLeRobot 固定健康站**.
 
 ## Chat LLM
 
@@ -51,7 +52,7 @@ to use the real LLM; otherwise the local companion fallback is used.
 # Depth-assisted gait maths + /snapshot/head_npz transport
 .venv/bin/python scripts/test_health_depth.py
 
-# Proof that step length survives a panning/swaying camera
+# Proof that step length and step count survive a moving head and base
 .venv/bin/python scripts/test_metric_camera_motion.py
 
 # Head pan/tilt hardware test (power the robot, start robot_api.py first)

@@ -144,6 +144,50 @@ def test_report_with_depth():
     check("tips non-empty", len(tips) >= 2)
 
 
+class _RecordingFollower(hs.BaseFollower):
+    """BaseFollower that records commands instead of driving the robot."""
+
+    def __init__(self):
+        super().__init__("http://127.0.0.1:1")
+        self.sent = []
+
+    def _post(self, payload):
+        self.sent.append(payload)
+        self.active = bool(payload.get("x") or payload.get("theta"))
+        return True
+
+
+def test_follow_standoff():
+    row = {"px_nose": (320, 180), "px_ankle_l": (300, 430),
+           "px_ankle_r": (340, 430)}
+    dmin = hs.min_full_body_distance(row, 2.6, 386.3, 480)
+    check("full-body standoff is computed", dmin is not None,
+          f"{dmin:.2f} m" if dmin else "")
+    check("1 m standoff is impossible for an adult", dmin and dmin > 1.3,
+          f"clamped to {dmin:.2f} m" if dmin else "")
+
+    f = _RecordingFollower()
+    f.update(2.0)                 # no target yet: must not move
+    check("follower waits for a measured height", f.sent == [])
+    f.target = 1.6
+    f.update(2.4)
+    check("follower approaches when too far", f.sent[-1].get("x", 0) > 0,
+          str(f.sent[-1]))
+    f.sent.clear()
+    f.update(1.6)
+    check("follower idles inside the deadband",
+          all(not p.get("x") for p in f.sent))
+    f.sent.clear()
+    f.update(0.55)
+    check("follower retreats when the person is too close",
+          f.sent[-1].get("x", 0) < 0, str(f.sent[-1]))
+    f.sent.clear()
+    f.update(None)
+    check("follower stops when the person is lost", f.sent[-1].get("stop"))
+    check("no forward motion below the safety floor",
+          f.MIN_FORWARD_M >= 0.8 and f.HARD_STOP_M < f.MIN_FORWARD_M)
+
+
 def main():
     test_npz_endpoint()
     test_add_depth_geometry()
@@ -151,6 +195,7 @@ def main():
     test_lateral_walk_axis()
     test_no_depth_fallback()
     test_report_with_depth()
+    test_follow_standoff()
     print()
     if FAILS:
         print(f"{len(FAILS)} FAILED: {FAILS}")

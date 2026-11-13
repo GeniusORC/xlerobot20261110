@@ -53,6 +53,10 @@ STATE = {
     "aiming": False,         # auto-framing loop running
     "track_message": "",
     "distance_m": None,
+    "follow": False,         # base follows the person during capture
+    "follow_distance": 1.0,  # requested distance in metres
+    "follow_target": None,   # effective distance after the full-body clamp
+    "follow_message": "",
 }
 LOCK = threading.Lock()
 TRACK_LOCK = threading.Lock()
@@ -61,6 +65,7 @@ LANDMARKER = None
 AIM_LANDMARKER = None
 TRACK_SRC = None
 TRACKER = None
+FOLLOWER = None
 TARGET_DISTANCE = 2.6
 
 # Major body connections for the overlay (MediaPipe legacy connections are not
@@ -299,6 +304,116 @@ def get_track_source():
     if TRACK_SRC is None:
         TRACK_SRC = Source(DEFAULT_SOURCE, depth=True)
     return TRACK_SRC
+
+
+class BaseFollower:
+    """Hold the person at a fixed distance while capturing.
+
+    Uses robot_api's short-lease ``/velocity`` endpoint, so the base stops by
+    itself within 0.6 s if this loop stalls or the process dies.  Speed is kept
+    well below walking speed and forward motion is refused below
+    ``MIN_FORWARD_M`` so the robot cannot walk into the person.
+    """
+
+    MIN_FORWARD_M = 0.85     # never drive forward closer than this
+    HARD_STOP_M = 0.60       # below this, back away
+    MAX_FORWARD = 0.12       # m/s, approaching a person
+    MAX_BACK = 0.20          # m/s, retreating (still slower than walking)
+    DEADBAND = 0.15          # m
+
+    def __init__(self, api=ROBOT_API):
+        self.api = api.rstrip("/")
+        self.target = None       # set once the person's height is measured
+        self.last_send = 0.0
+        self.last_stop = 0.0
+        self.fails = 0
+        self.active = False
+        self.last_speed = 0.0
+
+    def reset(self):
+        self.target = None
+        self.active = False
+        self.last_speed = 0.0
+
+    def _post(self, payload):
+        try:
+            r = requests.post(f"{self.api}/velocity", json=payload, timeout=0.8)
+            r.raise_for_status()
+            self.fails = 0
+            self.active = bool(payload.get("x") or payload.get("theta"))
+            return True
+        except Exception:
+            self.fails += 1
+            self.active = False
+            return False
+
+    def update(self, dist):
+        """One control step at ~10 Hz. ``dist`` is metres or None."""
+        now = time.time()
+        if self.target is None:
+            # No standoff is safe until the body height has been measured.
+            if self.active:
+                self._post({"stop": True})
+                self.active = False
+            return
+        if dist is None or not np.isfinite(dist):
+            # Person lost: stop at once, then keep the lease released.
+            if self.active or now - self.last_stop > 0.5:
+                self._post({"stop": True})
+                self.last_stop = now
+            return
+        target = self.target
+        if dist < self.HARD_STOP_M:
+            self._post({"x": -self.MAX_BACK})
+            self.last_speed = -self.MAX_BACK
+            self.last_send = now
+            return
+        err = dist - target
+        if abs(err) < self.DEADBAND:
+            if self.active:
+                self._post({"x": 0.0})
+            self.last_speed = 0.0
+            self.last_send = now
+            return
+        speed = float(np.clip(err * 0.30, -self.MAX_BACK, self.MAX_FORWARD))
+        if speed > 0 and dist < self.MIN_FORWARD_M:
+            speed = 0.0
+        self._post({"x": speed})
+        self.last_speed = speed
+        self.last_send = now
+
+    def stop(self):
+        self._post({"stop": True})
+        self.active = False
+        self.last_speed = 0.0
+
+
+def get_follower():
+    global FOLLOWER
+    if FOLLOWER is None:
+        FOLLOWER = BaseFollower(ROBOT_API)
+    return FOLLOWER
+
+
+def min_full_body_distance(row, dist, fy, frame_h, fill=0.85):
+    """Smallest distance at which this person still fits in the frame.
+
+    Uses the nose-to-ankle pixel span and the measured depth to recover the
+    metric body height, then solves for the distance where it fills ``fill``
+    of the image height.  At 1 m a standing adult does not fit in a 640x480
+    D455 frame, so a requested 1 m target is raised automatically.
+    """
+    nose = row.get("px_nose")
+    if nose is None or dist is None or not np.isfinite(dist):
+        return None
+    ankle_v = (row["px_ankle_l"][1] + row["px_ankle_r"][1]) / 2.0
+    body_px = float(ankle_v - nose[1])
+    if body_px <= 20:
+        return None
+    body_h_m = body_px * dist / fy * 1.08      # nose is below the head top
+    if not (1.15 < body_h_m < 2.3):
+        return None
+    return float(body_h_m * fy / (fill * frame_h))
 
 
 def make_image_landmarker():
@@ -542,6 +657,7 @@ def extract(lms, w, h):
         "px_rs": p["RS"],
         "px_lh": p["LH"],
         "px_rh": p["RH"],
+        "px_nose": point(lms, 0, w, h, min_vis=0.3),
     }
 
 
@@ -663,6 +779,16 @@ def draw_overlay(frame, lms):
     return out
 
 
+def _fill_nan(x):
+    """Linear-interpolate NaNs so peak detection can run on sparse depth."""
+    v = np.asarray(x, dtype=float)
+    ok = np.isfinite(v)
+    if ok.sum() < 3:
+        return v
+    idx = np.arange(v.size)
+    return np.interp(idx, idx[ok], v[ok])
+
+
 def analyze(series, duration, fps):
     if not series:
         return None
@@ -673,11 +799,27 @@ def analyze(series, duration, fps):
     hL, hR = arr("hip_l"), arr("hip_r")
     trunk = arr("trunk")
     aL, aR = arr("ankle_ly"), arr("ankle_ry")
+    bf_l = arr("bf_l")
+    bf_r = arr("bf_r")
     step_count = 0
-    if len(series) > 5:
+    step_detector = "image_ankle_y"
+    min_gap = max(3, int(0.35 * fps))
+    # Preferred: feet swing forward/backwards in the body frame. Because the
+    # body frame travels with the person, this keeps working when the head or
+    # the base moves during the capture.
+    if np.isfinite(bf_l).sum() >= 8 and np.isfinite(bf_r).sum() >= 8:
+        step_detector = "depth_body_frame"
         try:
-            pl, _ = find_peaks(-aL, distance=max(3, int(0.35 * fps)), prominence=0.005)
-            pr, _ = find_peaks(-aR, distance=max(3, int(0.35 * fps)), prominence=0.005)
+            step_count = int(len(find_peaks(_fill_nan(bf_l), distance=min_gap,
+                                            prominence=0.04)[0]) +
+                             len(find_peaks(_fill_nan(bf_r), distance=min_gap,
+                                            prominence=0.04)[0]))
+        except Exception:
+            step_count = 0
+    if step_detector == "image_ankle_y" and len(series) > 5:
+        try:
+            pl, _ = find_peaks(-aL, distance=min_gap, prominence=0.005)
+            pr, _ = find_peaks(-aR, distance=min_gap, prominence=0.005)
             step_count = int(len(pl) + len(pr))
         except Exception:
             step_count = 0
@@ -699,6 +841,7 @@ def analyze(series, duration, fps):
         "knee_symmetry_pct": round(sym, 1),
         "step_length_norm": round(float(np.nanmax(np.abs(arr("ankle_lx") - arr("ankle_rx")))), 3),
         "sway_norm": round(float(np.nanstd(arr("hip_x"))), 3),
+        "step_detector": step_detector,
     }
     metrics.update(metric_depth_metrics(series))
     return metrics
@@ -809,7 +952,8 @@ def plot_gait(series, fps, path):
 def run_capture(source, duration, fps):
     global LANDMARKER
     with LOCK:
-        STATE.update(running=True, progress=0.0, error=None)
+        STATE.update(running=True, progress=0.0, error=None,
+                     follow_target=None)
     STOP.clear()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     src = Source(source, depth=True)
@@ -818,6 +962,12 @@ def run_capture(source, duration, fps):
     last_overlay = None
     start = time.time()
     lm = LANDMARKER
+    follow = bool(STATE.get("follow"))
+    requested = float(STATE.get("follow_distance") or 1.0)
+    follower = get_follower() if follow else None
+    if follower is not None:
+        follower.reset()
+        set_track(follow_message=f"跟随准备中（目标 {requested:.1f} m）")
     try:
         if lm is None:
             lm = make_landmarker()
@@ -826,6 +976,7 @@ def run_capture(source, duration, fps):
             elapsed = time.time() - start
             if elapsed >= duration:
                 break
+            dist_now = None
             frame = src.read()
             if frame is not None:
                 h, w = frame.shape[:2]
@@ -841,9 +992,32 @@ def run_capture(source, duration, fps):
                             add_depth(row, depth, K, src.depth_scale)
                             if np.isfinite(row.get("dist_m", np.nan)):
                                 depth_ok += 1
+                                dist_now = float(row["dist_m"])
                                 with LOCK:
-                                    STATE["distance_m"] = round(
-                                        float(row["dist_m"]), 2)
+                                    STATE["distance_m"] = round(dist_now, 2)
+                                # First valid frame: work out how close the
+                                # robot may come before the full body leaves
+                                # the frame, then clamp the requested target.
+                                if follower is not None and follower.target is None:
+                                    dmin = min_full_body_distance(
+                                        row, dist_now, K[1], h)
+                                    if dmin is None:
+                                        set_track(follow_message=(
+                                            "还没量到身高，暂不跟随"))
+                                    else:
+                                        eff = max(requested, dmin)
+                                        follower.target = float(eff)
+                                        with LOCK:
+                                            STATE["follow_target"] = round(
+                                                float(eff), 2)
+                                        if eff > requested + 0.03:
+                                            set_track(follow_message=(
+                                                f"跟随 {eff:.1f} m："
+                                                f"{requested:.1f} m 时全身会出框，"
+                                                f"已自动拉远以保证准度"))
+                                        else:
+                                            set_track(follow_message=(
+                                                f"跟随 {eff:.1f} m"))
                         if STATE.get("track"):
                             u = (row["px_hip"][0] + row["px_ls"][0]
                                  + row["px_rs"][0]) / 3.0
@@ -855,6 +1029,10 @@ def run_capture(source, duration, fps):
                         last_overlay = draw_overlay(frame, lms)
                 with LOCK:
                     STATE["progress"] = min(1.0, elapsed / duration)
+            # Keep the 1 m (or clamped) standoff. A missing person stops the
+            # base immediately; the API lease also expires on its own.
+            if follower is not None:
+                follower.update(dist_now)
             time.sleep(max(0.0, 1.0 / fps - 0.005))
         elapsed = time.time() - start
         if not series:
@@ -894,6 +1072,10 @@ def run_capture(source, duration, fps):
         traceback.print_exc()
         with LOCK:
             STATE.update(running=False, progress=1.0, error=f"{type(e).__name__}: {e}")
+    finally:
+        if follower is not None:
+            follower.stop()
+            set_track(follow_message="采集结束，底盘已停")
 
 
 def load_latest_result():
@@ -1139,6 +1321,10 @@ def start():
 @app.post("/api/stop")
 def stop():
     STOP.set()
+    try:
+        get_follower().stop()
+    except Exception:
+        pass
     stop_robot()
     return jsonify({"ok": True})
 
@@ -1155,6 +1341,26 @@ def api_track():
         except Exception:
             pass
     return jsonify({"ok": True, "track": on})
+
+
+@app.post("/api/follow")
+def api_follow():
+    """Turn base-following during capture on/off and set the standoff."""
+    data = request.get_json(force=True, silent=True) or {}
+    on = bool(data.get("on", True))
+    dist = float(data.get("distance", STATE.get("follow_distance") or 1.0))
+    dist = float(np.clip(dist, 0.5, 4.0))
+    set_track(follow=on, follow_distance=dist, follow_target=None,
+              follow_message=(f"采集时底盘跟随：开（目标 {dist:.1f} m，"
+                              f"全身出框时自动拉远）") if on
+              else "采集时底盘跟随：关")
+    if not on:
+        try:
+            get_follower().reset()
+            get_follower().stop()
+        except Exception:
+            pass
+    return jsonify({"ok": True, "follow": on, "distance": dist})
 
 
 @app.post("/api/aim")
@@ -1206,7 +1412,13 @@ h1{font-size:22px;margin:0 0 14px}
 button{font-size:17px;padding:13px 18px;margin:5px;border:0;border-radius:10px;cursor:pointer}
 .prep{background:#36c;color:#fff}.start{background:#2a8;color:#fff}.stop{background:#d33;color:#fff}
 .aim{background:#963;color:#fff}.track{background:#3a7;color:#fff}
-.track.on{background:#0a5}
+.track.on{background:#0a5}.follow{background:#357;color:#fff}
+.follow.on{background:#08c}
+.followrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0}
+.followrow label{font-size:13px;color:#ccc;display:flex;align-items:center;
+  gap:4px;white-space:nowrap}
+.followrow input{width:62px;background:#111;color:#eee;border:1px solid #444;
+  border-radius:4px;padding:2px 4px}
 button:disabled{opacity:.5;cursor:default}
 img{width:100%;background:#000;border-radius:8px;margin-top:8px}
 #bar{height:10px;background:#333;border-radius:5px;overflow:hidden;margin:10px 0}
@@ -1232,7 +1444,15 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
     <button class="stop" onclick="stopCapture()">停止</button>
     <button class="aim" onclick="aim()">自动取景（走到 2–3 米）</button>
     <button id="btn_track" class="track" onclick="toggleTrack()">头部跟随：关</button>
+    <div class="followrow">
+      <button id="btn_follow" class="follow" onclick="toggleFollow()">采集时跟随：关</button>
+      <label>目标距离
+        <input id="follow_dist" type="number" min="0.5" max="4" step="0.1" value="1.0">
+        m
+      </label>
+    </div>
     <div id="track_msg" style="font-size:13px;color:#9cf;margin:6px 0">机器人未连接时仅能采集，不能自动取景。</div>
+    <div id="follow_msg" style="font-size:13px;color:#9c9;margin:6px 0"></div>
     <div id="bar"><div id="fill"></div></div>
     <div id="msg">请让老人站在头部相机前，露出全身；距离 2–3 米。</div>
     <img id="live" src="http://127.0.0.1:8080/stream/head">
@@ -1293,6 +1513,16 @@ async function toggleTrack(){
   b.textContent='头部跟随：'+(tracking?'开':'关');
   b.classList.toggle('on',tracking);
 }
+let following=false;
+async function toggleFollow(){
+  following=!following;
+  const d=parseFloat(document.getElementById('follow_dist').value)||1.0;
+  await fetch('/api/follow',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:following,distance:d})});
+  const b=document.getElementById('btn_follow');
+  b.textContent='采集时跟随：'+(following?d.toFixed(1)+' m':'关');
+  b.classList.toggle('on',following);
+  poll();
+}
 function set(id,v){ document.getElementById(id).textContent=v; }
 let lastSession=null;
 function renderLatest(l){
@@ -1350,6 +1580,12 @@ async function poll(){
     const b=document.getElementById('btn_track');
     b.textContent='头部跟随：'+(tracking?'开':'关');
     b.classList.toggle('on',tracking);
+    following=!!j.follow;
+    const bf=document.getElementById('btn_follow');
+    const eff=Number(j.follow_target||j.follow_distance||1.0);
+    bf.textContent='采集时跟随：'+(following?eff.toFixed(1)+' m':'关');
+    bf.classList.toggle('on',following);
+    if(j.follow_message) document.getElementById('follow_msg').textContent=j.follow_message;
     if(j.latest) renderLatest(j.latest);
   }catch(e){}
   clearTimeout(pollTimer);
@@ -1371,10 +1607,17 @@ def main():
                     help="start with head tracking enabled")
     ap.add_argument("--target-distance", type=float, default=2.6,
                     help="auto-framing distance in metres")
+    ap.add_argument("--follow", action="store_true",
+                    help="start with base following enabled during capture")
+    ap.add_argument("--follow-distance", type=float, default=1.0,
+                    help="requested standoff while capturing (clamped so the "
+                         "full body stays in frame)")
     args = ap.parse_args()
     STATE["source"] = args.source
     STATE["duration"] = args.duration
     STATE["track"] = bool(args.track)
+    STATE["follow"] = bool(args.follow)
+    STATE["follow_distance"] = float(args.follow_distance)
     TARGET_DISTANCE = args.target_distance
     init_db()
     load_latest_result()
@@ -1382,8 +1625,8 @@ def main():
     threading.Thread(target=idle_track_loop, daemon=True).start()
     print(f"health station on http://{args.host}:{args.port}", flush=True)
     print(f"source: {args.source}; track={STATE['track']}; "
+          f"follow={STATE['follow']}({STATE['follow_distance']:.1f} m); "
           f"target={TARGET_DISTANCE} m", flush=True)
-    print(f"source: {args.source}", flush=True)
     app.run(host=args.host, port=args.port, threaded=True)
 
 
