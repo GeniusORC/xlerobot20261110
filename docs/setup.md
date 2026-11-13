@@ -736,9 +736,16 @@ POST /drive {"x":..,"theta":..,"duration":..}   bounded fine positioning
 GET  /status                    -> also reports head/busy state
 ```
 
-Limits: pan ±70, tilt ±30 (narrower than mechanical), drive |x| ≤ 0.08 m/s,
-|theta| ≤ 25 °/s, duration ≤ 3 s. All bus access goes through one lock so the
-10 Hz tracker, the voice commands and the status endpoint cannot interleave.
+Limits: the tracking window is ±70 pan / ±30 tilt **around the pose captured
+when the service connects** (not around absolute 0), so a head resting far from
+the midpoint is never commanded across the whole range. Each command moves at
+most 8 normalized units, and `center` ramps smoothly back to 0 (opt-in, can be
+a large move). Drive |x| ≤ 0.08 m/s, |theta| ≤ 25 °/s, duration ≤ 3 s. All bus
+access goes through one lock so the 10 Hz tracker, the voice commands and the
+status endpoint cannot interleave.
+
+`GET /head` reports the raw pose plus `pan_ref`/`tilt_ref` and the effective
+`pan_window`/`tilt_window`.
 
 Head mapping: `head_motor_1` = pan (yaw), `head_motor_2` = tilt (pitch), IDs 7
 and 8 on bus1.

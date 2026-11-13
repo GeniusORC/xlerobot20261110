@@ -46,11 +46,18 @@ SHUTDOWN = False
 BUS_LOCK = threading.Lock()
 
 # Head pan/tilt are ordinary STS3215 position servos on bus1 (IDs 7 and 8).
-# Values are normalized to [-100, 100]; 0 is mid-range. Limits below are
-# deliberately narrower than the mechanical range.
+# Values are normalized to [-100, 100]; 0 is the calibration midpoint.
+#
+# The tracking envelope is *relative to the pose captured when the service
+# connects*, not absolute. A head that happens to rest far from the midpoint
+# (e.g. tilt -71) must not be commanded straight to 0, which would be a ~45
+# degree swing. Every command also moves at most MAX_STEP normalized units.
 PAN_MOTOR, TILT_MOTOR = "head_motor_1", "head_motor_2"
-PAN_LIMIT = (-70.0, 70.0)
-TILT_LIMIT = (-30.0, 30.0)
+PAN_SPAN = 70.0               # tracking envelope around the reference pose
+TILT_SPAN = 30.0
+HARD_LIMIT = (-98.0, 98.0)    # normalized motor range, 0 = calibration mid
+MAX_STEP = 8.0                # max normalized units per command
+HEAD_REF = {"pan": None, "tilt": None}
 
 # Short-lease velocity command used by continuous following. The base keeps
 # moving only while the health station keeps refreshing this lease. Approaching
@@ -101,15 +108,71 @@ def _read_head():
     return float(vals.get(PAN_MOTOR, 0.0)), float(vals.get(TILT_MOTOR, 0.0))
 
 
-def _set_head(pan=None, tilt=None):
-    action = {}
-    if pan is not None:
-        action[f"{PAN_MOTOR}.pos"] = float(np.clip(pan, *PAN_LIMIT))
-    if tilt is not None:
-        action[f"{TILT_MOTOR}.pos"] = float(np.clip(tilt, *TILT_LIMIT))
-    if action:
+def _ensure_head_ref():
+    """Remember where the head was when the service first touched it."""
+    if HEAD_REF["pan"] is None or HEAD_REF["tilt"] is None:
+        pan, tilt = _read_head()
+        HEAD_REF["pan"], HEAD_REF["tilt"] = pan, tilt
+    return HEAD_REF["pan"], HEAD_REF["tilt"]
+
+
+def _head_window(axis):
+    ref = HEAD_REF["pan"] if axis == "pan" else HEAD_REF["tilt"]
+    span = PAN_SPAN if axis == "pan" else TILT_SPAN
+    if ref is None:
+        return HARD_LIMIT
+    return (max(HARD_LIMIT[0], ref - span),
+            min(HARD_LIMIT[1], ref + span))
+
+
+def _set_head(pan=None, tilt=None, dpan=None, dtilt=None, center=False):
+    """Move the head without ever making a large jump.
+
+    * Absolute ``pan``/``tilt`` are in the calibration frame (0 = midpoint)
+      and clamped to a window around the reference pose.
+    * ``dpan``/``dtilt`` are relative to the current position.
+    * ``center`` ramps smoothly back to 0 and re-references the head there.
+    * Each step moves at most ``MAX_STEP`` normalized units.
+    """
+    pan0, tilt0 = _read_head()
+    _ensure_head_ref()
+    if center:
+        target_pan, target_tilt = 0.0, 0.0
+        steps, pause = 80, 0.05
+    else:
+        if pan is None and dpan is not None:
+            pan = pan0 + float(dpan)
+        if tilt is None and dtilt is not None:
+            tilt = tilt0 + float(dtilt)
+        lo, hi = _head_window("pan")
+        target_pan = None if pan is None else float(np.clip(pan, lo, hi))
+        lo, hi = _head_window("tilt")
+        target_tilt = None if tilt is None else float(np.clip(tilt, lo, hi))
+        steps, pause = 1, 0.0
+
+    moved = False
+    for _ in range(steps):
+        if STOP_EVENT.is_set():
+            break
+        pan_now, tilt_now = _read_head()
+        dp = (0.0 if target_pan is None
+              else float(np.clip(target_pan - pan_now, -MAX_STEP, MAX_STEP)))
+        dt = (0.0 if target_tilt is None
+              else float(np.clip(target_tilt - tilt_now, -MAX_STEP, MAX_STEP)))
+        action = {}
+        if abs(dp) > 0.1:
+            action[f"{PAN_MOTOR}.pos"] = float(np.clip(pan_now + dp, *HARD_LIMIT))
+        if abs(dt) > 0.1:
+            action[f"{TILT_MOTOR}.pos"] = float(np.clip(tilt_now + dt, *HARD_LIMIT))
+        if not action:
+            break
         _rmw(ROBOT.send_action, action)
-    return action
+        moved = True
+        if pause:
+            time.sleep(pause)
+    if center:
+        HEAD_REF["pan"], HEAD_REF["tilt"] = 0.0, 0.0
+    return {"pan": target_pan, "tilt": target_tilt, "moved": moved}
 
 
 def _stop():
@@ -236,18 +299,18 @@ def worker():
             kind = intent.get("type")
             if kind == "head":
                 try:
-                    pan0, tilt0 = _read_head()
+                    res = _set_head(pan=intent.get("pan"),
+                                    tilt=intent.get("tilt"),
+                                    dpan=intent.get("dpan"),
+                                    dtilt=intent.get("dtilt"),
+                                    center=bool(intent.get("center")))
                     if intent.get("center"):
-                        _set_head(0.0, 0.0)
+                        msg = "头部已回中"
+                    elif res["moved"]:
+                        msg = "头部已调整"
                     else:
-                        pan = intent.get("pan")
-                        tilt = intent.get("tilt")
-                        if pan is None and intent.get("dpan") is not None:
-                            pan = pan0 + float(intent["dpan"])
-                        if tilt is None and intent.get("dtilt") is not None:
-                            tilt = tilt0 + float(intent["dtilt"])
-                        _set_head(pan, tilt)
-                    set_state(busy=False, message="头部已调整")
+                        msg = "头部已到位"
+                    set_state(busy=False, message=msg)
                 except Exception as e:
                     set_state(message=f"头部调整失败: {e}")
                 continue
@@ -313,10 +376,17 @@ def head_status():
         return jsonify({"error": "robot not connected", **get_state()}), 503
     try:
         pan, tilt = _read_head()
+        _ensure_head_ref()
+        pan_window = _head_window("pan")
+        tilt_window = _head_window("tilt")
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
     return jsonify({"pan": pan, "tilt": tilt,
-                    "pan_limit": PAN_LIMIT, "tilt_limit": TILT_LIMIT})
+                    "pan_ref": HEAD_REF["pan"], "tilt_ref": HEAD_REF["tilt"],
+                    "pan_window": list(pan_window),
+                    "tilt_window": list(tilt_window),
+                    "hard_limit": list(HARD_LIMIT),
+                    "max_step": MAX_STEP})
 
 
 @app.post("/head")
