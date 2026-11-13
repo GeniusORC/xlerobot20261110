@@ -518,15 +518,27 @@ def aim_robot(target=None, tol=0.45, timeout=40.0):
             depth, K = src.read_depth()
             person = detect_person(frame, depth, K, src.depth_scale)
             if person is None:
-                # Search: alternate a downward tilt with a horizontal sweep so
-                # a person standing below the current view is found too.
-                if tracker.search_dir > 0:
-                    tracker.head(dtilt=8.0)
+                # Search in a sensible order.  The centred pose points at the
+                # floor, so first tilt up to roughly eye level, then sweep a
+                # modest horizontal arc.  A real person is normally in front;
+                # this finds them in a few seconds instead of oscillating.
+                try:
+                    pos = requests.get(f"{ROBOT_API}/head", timeout=1.5).json()
+                    tilt_now = float(pos.get("tilt", 0.0))
+                    pan_now = float(pos.get("pan", 0.0))
+                except Exception:
+                    tilt_now, pan_now = 0.0, 0.0
+                if tilt_now > -60.0:
+                    tracker.head(dtilt=-8.0)
+                elif pan_now > 28.0:
+                    tracker.head(dpan=-12.0)
+                elif pan_now < -28.0:
+                    tracker.head(dpan=12.0)
                 else:
-                    tracker.head(dpan=10.0 * tracker.search_dir)
-                tracker.search_dir *= -1.0
+                    tracker.head(dpan=12.0 * tracker.search_dir)
+                    tracker.search_dir *= -1.0
                 set_track(track_message="没看到全身，正在调整视角寻找")
-                time.sleep(0.8)
+                time.sleep(0.6)
                 continue
             row, dist, (u, v) = person
             h, w = frame.shape[:2]
