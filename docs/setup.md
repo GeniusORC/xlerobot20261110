@@ -672,3 +672,100 @@ PASS report mentions metre step length
 Limitations: monocular-depth step length is an estimate (D455 depth noise,
 loose clothing, foot occlusion). It is suitable for trend monitoring, not for
 diagnosis or for replacing motion capture.
+
+## 20. Moving camera: head tracking, auto-framing, metric invariance
+
+The D455 sits on the 2-DoF head, so both the head (pan/tilt) and the base can
+move. A moving camera normally corrupts metric gait measurement, so the
+measurement was changed to be invariant to camera motion, and then the camera
+was allowed to move.
+
+### 20.1 Body-frame step length (camera-motion invariant)
+
+Earlier the step length was measured along a camera axis (`X` or `Z`). That is
+only valid for a static camera. Now every pose frame is unprojected to 3D with
+its own depth:
+
+```text
+P = ((u-cx)*Z/fx, (v-cy)*Z/fy, Z)
+```
+
+and the person's own frame is built from their shoulders and hips:
+
+```text
+up    = normalize(P_shoulder_mid - P_hip_mid)
+right = normalize((P_RS - P_LS) - ((P_RS - P_LS).up) up)
+fwd   = normalize(cross(up, right))
+
+step  = P95( (P_ankle - P_hip_mid).fwd ) - P5( ... )
+```
+
+Because the foot vector and the axis are expressed in the same camera frame,
+rotating or translating the camera does not change the result.
+
+### 20.2 Simulation validation
+
+`scripts/test_metric_camera_motion.py` simulates a walking person, projects the
+joints through the real pinhole model while the head pans to follow them
+(±18° yaw) and the base sways, rasterises a depth map, and runs the real
+`extract -> add_depth -> analyze` pipeline.
+
+```text
+=== walking lateral (ground-truth step length 0.59 m) ===
+static camera          body=0.58 m (err 0.009)  camera-axis=0.58 m (err 0.009)
+panning/swaying camera body=0.59 m (err 0.001)  camera-axis=0.53 m (err 0.059)
+
+=== walking towards (ground-truth 0.59 m) ===
+static camera          body=0.57 m (err 0.019)  camera-axis=0.57 m (err 0.019)
+panning/swaying camera body=0.59 m (err 0.001)  camera-axis=0.59 m (err 0.001)
+```
+
+The body-frame estimate stays within 2 cm under camera motion; the old
+camera-axis estimate drifts by 6 cm in the lateral case.
+
+### 20.3 Head and base control
+
+`robot_api.py` gained:
+
+```text
+GET  /head                      -> {"pan":..,"tilt":..}
+POST /head  {"pan":..,"tilt":..}   absolute, normalized -100..100
+POST /head  {"dpan":..,"dtilt":..} relative
+POST /head  {"center":true}        back to mid-range
+POST /drive {"x":..,"theta":..,"duration":..}   bounded fine positioning
+GET  /status                    -> also reports head/busy state
+```
+
+Limits: pan ±70, tilt ±30 (narrower than mechanical), drive |x| ≤ 0.08 m/s,
+|theta| ≤ 25 °/s, duration ≤ 3 s. All bus access goes through one lock so the
+10 Hz tracker, the voice commands and the status endpoint cannot interleave.
+
+Head mapping: `head_motor_1` = pan (yaw), `head_motor_2` = tilt (pitch), IDs 7
+and 8 on bus1.
+
+### 20.4 Health-station behaviour
+
+| Mode | Base | Head | Metric |
+|---|---|---|---|
+| Idle + 头部跟随 | still | pans/tilts to keep the person centred | live distance shown |
+| 自动取景 | drives to 2.6 ± 0.45 m | aims at the person | full-body framing |
+| 采集 | **still** | follows, keeps the body framed | body-frame step length |
+
+The base deliberately does not move during a capture: cadence and step
+detection use image-space ankle motion, and a moving base adds a trend that
+makes step counting noisier. The head may move freely. Run 自动取景 first, then
+start the capture.
+
+The tracker closes the loop on pixels, so no motor-angle calibration is
+needed. If the pan direction is inverted on a given build, it detects the error
+growing over three updates and flips the sign automatically (only while the
+target is roughly still, never mid-walk).
+
+### 20.5 Hardware test
+
+```bash
+source scripts/env.sh robot
+python scripts/robot_api.py --port 8090      # power the robot first
+python scripts/test_head.py                  # read-only
+python scripts/test_head.py --move           # 5-unit nudge, then re-centre
+```

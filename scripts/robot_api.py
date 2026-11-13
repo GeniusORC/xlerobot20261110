@@ -7,7 +7,10 @@ Run in the robot environment:
 
 Endpoints:
   GET  /status
-  POST /command   {"intent": "stop"|"come"|"report"}
+  POST /command   {"intent": "stop"|"come"|"report"|...}
+  GET  /head                        head pan/tilt (normalized -100..100)
+  POST /head      {"pan":..,"tilt":..} or {"dpan":..,"dtilt":..} or {"center":true}
+  POST /drive     {"x":m/s,"theta":deg/s,"duration":s}  bounded fine positioning
   POST /estop
 """
 import argparse
@@ -39,6 +42,14 @@ COMMANDS = queue.Queue()
 STOP_EVENT = threading.Event()
 ROBOT = None
 SHUTDOWN = False
+BUS_LOCK = threading.Lock()
+
+# Head pan/tilt are ordinary STS3215 position servos on bus1 (IDs 7 and 8).
+# Values are normalized to [-100, 100]; 0 is mid-range. Limits below are
+# deliberately narrower than the mechanical range.
+PAN_MOTOR, TILT_MOTOR = "head_motor_1", "head_motor_2"
+PAN_LIMIT = (-70.0, 70.0)
+TILT_LIMIT = (-30.0, 30.0)
 
 
 def set_state(**kwargs):
@@ -72,6 +83,28 @@ def connect_robot(cfg):
     return None
 
 
+def _rmw(fn, *a, **kw):
+    """Run a serial-bus operation under the shared bus lock."""
+    with BUS_LOCK:
+        return fn(*a, **kw)
+
+
+def _read_head():
+    vals = _rmw(ROBOT.bus1.sync_read, "Present_Position", [PAN_MOTOR, TILT_MOTOR])
+    return float(vals.get(PAN_MOTOR, 0.0)), float(vals.get(TILT_MOTOR, 0.0))
+
+
+def _set_head(pan=None, tilt=None):
+    action = {}
+    if pan is not None:
+        action[f"{PAN_MOTOR}.pos"] = float(np.clip(pan, *PAN_LIMIT))
+    if tilt is not None:
+        action[f"{TILT_MOTOR}.pos"] = float(np.clip(tilt, *TILT_LIMIT))
+    if action:
+        _rmw(ROBOT.send_action, action)
+    return action
+
+
 def _stop():
     STOP_EVENT.set()
     try:
@@ -87,13 +120,21 @@ def _move(x: float, theta: float, duration: float, message: str):
     deadline = time.time() + duration
     try:
         while time.time() < deadline and not STOP_EVENT.is_set():
-            ROBOT.send_action({"x.vel": x, "theta.vel": theta})
+            _rmw(ROBOT.send_action, {"x.vel": x, "theta.vel": theta})
             time.sleep(0.05)
         ROBOT.stop_base()
         set_state(busy=False, message="已停止" if STOP_EVENT.is_set() else message + "，已停稳",
                   x_vel=0.0, theta_vel=0.0)
     except Exception as e:
         set_state(busy=False, message=f"动作失败: {e}")
+
+
+def _drive(x: float, theta: float, duration: float):
+    """Bounded fine positioning used by the health station auto-framing."""
+    x = float(np.clip(x, -0.08, 0.08))
+    theta = float(np.clip(theta, -25.0, 25.0))
+    duration = float(np.clip(duration, 0.05, 3.0))
+    _move(x, theta, duration, "正在微调位置")
 
 
 def _look_at_person():
@@ -130,7 +171,7 @@ def _look_at_person():
                         set_state(busy=False, message="已经面向您了", x_vel=0.0, theta_vel=0.0)
                         return
                     theta = max(-12.0, min(12.0, -err * 60.0))
-                    ROBOT.send_action({"x.vel": 0.0, "theta.vel": theta})
+                    _rmw(ROBOT.send_action, {"x.vel": 0.0, "theta.vel": theta})
             time.sleep(0.12)
         ROBOT.stop_base()
         set_state(busy=False, message="已经面向您了" if found else "没有看到您的脸",
@@ -153,10 +194,36 @@ def worker():
         if intent == "stop":
             _stop()
             continue
+        if isinstance(intent, dict):
+            kind = intent.get("type")
+            if kind == "head":
+                try:
+                    pan0, tilt0 = _read_head()
+                    if intent.get("center"):
+                        _set_head(0.0, 0.0)
+                    else:
+                        pan = intent.get("pan")
+                        tilt = intent.get("tilt")
+                        if pan is None and intent.get("dpan") is not None:
+                            pan = pan0 + float(intent["dpan"])
+                        if tilt is None and intent.get("dtilt") is not None:
+                            tilt = tilt0 + float(intent["dtilt"])
+                        _set_head(pan, tilt)
+                    set_state(busy=False, message="头部已调整")
+                except Exception as e:
+                    set_state(message=f"头部调整失败: {e}")
+                continue
+            if kind == "drive":
+                _drive(float(intent.get("x", 0.0)),
+                       float(intent.get("theta", 0.0)),
+                       float(intent.get("duration", 0.5)))
+                continue
+            continue
         if intent == "report":
             set_state(busy=True, last_intent="report", message="正在读取状态")
             try:
-                vel = ROBOT.bus2.sync_read("Present_Velocity", ROBOT.base_motors, normalize=False)
+                vel = _rmw(ROBOT.bus2.sync_read, "Present_Velocity",
+                           ROBOT.base_motors, normalize=False)
                 set_state(busy=False, message="报告完成",
                           x_vel=float(vel.get("base_left_wheel", 0)),
                           theta_vel=float(vel.get("base_right_wheel", 0)))
@@ -208,6 +275,42 @@ def command():
         STOP_EVENT.set()
     COMMANDS.put(intent)
     return jsonify({"queued": intent, **get_state()})
+
+
+@app.get("/head")
+def head_status():
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    try:
+        pan, tilt = _read_head()
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+    return jsonify({"pan": pan, "tilt": tilt,
+                    "pan_limit": PAN_LIMIT, "tilt_limit": TILT_LIMIT})
+
+
+@app.post("/head")
+def head_set():
+    data = request.get_json(force=True, silent=True) or {}
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    if not any(k in data for k in ("pan", "tilt", "dpan", "dtilt", "center")):
+        return jsonify({"error": "need pan/tilt/dpan/dtilt/center"}), 400
+    COMMANDS.put({"type": "head", **data})
+    return jsonify({"queued": "head", **data})
+
+
+@app.post("/drive")
+def drive():
+    data = request.get_json(force=True, silent=True) or {}
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    cmd = {"type": "drive",
+           "x": float(data.get("x", 0.0)),
+           "theta": float(data.get("theta", 0.0)),
+           "duration": float(data.get("duration", 0.5))}
+    COMMANDS.put(cmd)
+    return jsonify({"queued": "drive", **cmd})
 
 
 @app.post("/estop")

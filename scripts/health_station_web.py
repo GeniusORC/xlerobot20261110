@@ -49,10 +49,19 @@ STATE = {
     "latest": None,
     "source": DEFAULT_SOURCE,
     "duration": 10.0,
+    "track": False,          # head follows the person (preview + capture)
+    "aiming": False,         # auto-framing loop running
+    "track_message": "",
+    "distance_m": None,
 }
 LOCK = threading.Lock()
+TRACK_LOCK = threading.Lock()
 STOP = threading.Event()
 LANDMARKER = None
+AIM_LANDMARKER = None
+TRACK_SRC = None
+TRACKER = None
+TARGET_DISTANCE = 2.6
 
 # Major body connections for the overlay (MediaPipe legacy connections are not
 # exported by the Tasks API in mediapipe 1.x).
@@ -192,6 +201,286 @@ def derive_depth_url(source):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Active camera: head pan/tilt and base fine positioning
+# ---------------------------------------------------------------------------
+
+class HeadClient:
+    """Small client for robot_api's /head and /drive endpoints.
+
+    The head is commanded in *relative* normalized units, so no motor-angle
+    calibration is needed: we close the loop on pixels.  If the pan direction
+    is wrong for a given build, the tracker notices the error growing and flips
+    the sign by itself (only while the target is roughly still).
+    """
+
+    def __init__(self, api=ROBOT_API):
+        self.api = api.rstrip("/")
+        self.pan_sign = 1.0
+        self.tilt_sign = 1.0
+        self._prev = None
+        self._worse = 0
+        self.fails = 0
+        self.search_dir = 1.0
+        self.pan = 0.0
+        self.tilt = 0.0
+
+    def available(self):
+        return self.fails < 5
+
+    def _post(self, path, payload, timeout=1.2):
+        try:
+            r = requests.post(f"{self.api}{path}", json=payload, timeout=timeout)
+            if r.status_code == 503:
+                self.fails += 1
+                return False
+            r.raise_for_status()
+            self.fails = 0
+            return True
+        except Exception:
+            self.fails += 1
+            return False
+
+    def head(self, dpan=0.0, dtilt=0.0, pan=None, tilt=None, center=False):
+        payload = {}
+        if center:
+            payload["center"] = True
+        else:
+            if pan is None and abs(dpan) > 1e-3:
+                payload["dpan"] = float(dpan)
+            if tilt is None and abs(dtilt) > 1e-3:
+                payload["dtilt"] = float(dtilt)
+        if not payload:
+            return True
+        return self._post("/head", payload)
+
+    def drive(self, x=0.0, theta=0.0, duration=0.5):
+        return self._post("/drive", {"x": x, "theta": theta,
+                                     "duration": duration}, timeout=2.0)
+
+    def step(self, u, v, w, h, v_frac=0.5, kp=(9.0, 6.0), dead=0.02,
+             adapt=False):
+        """Move the head so the target pixel moves toward (w/2, v_frac*h)."""
+        ex = (u - w / 2.0) / float(w)
+        ey = (v - v_frac * h) / float(h)
+        if adapt and self._prev is not None:
+            if abs(ex) > abs(self._prev[0]) + 0.01:
+                self._worse += 1
+                if self._worse >= 3:
+                    self.pan_sign *= -1.0
+                    self._worse = 0
+                    self._prev = None
+                    return False
+            else:
+                self._worse = 0
+        self._prev = (ex, ey)
+        dpan = 0.0 if abs(ex) < dead else -self.pan_sign * kp[0] * ex
+        dtilt = 0.0 if abs(ey) < dead else -self.tilt_sign * kp[1] * ey
+        dpan = float(np.clip(dpan, -12.0, 12.0))
+        dtilt = float(np.clip(dtilt, -8.0, 8.0))
+        if dpan == 0.0 and dtilt == 0.0:
+            return True
+        ok = self.head(dpan=dpan, dtilt=dtilt)
+        if ok:
+            self.pan = float(np.clip(self.pan + dpan, -70, 70))
+            self.tilt = float(np.clip(self.tilt + dtilt, -30, 30))
+        return ok
+
+
+def get_tracker():
+    global TRACKER
+    if TRACKER is None:
+        TRACKER = HeadClient(ROBOT_API)
+    return TRACKER
+
+
+def get_track_source():
+    global TRACK_SRC
+    if TRACK_SRC is None:
+        TRACK_SRC = Source(DEFAULT_SOURCE, depth=True)
+    return TRACK_SRC
+
+
+def make_image_landmarker():
+    base = python.BaseOptions(model_asset_path=MODEL)
+    opts = vision.PoseLandmarkerOptions(
+        base_options=base,
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.4,
+        min_pose_presence_confidence=0.4,
+    )
+    return vision.PoseLandmarker.create_from_options(opts)
+
+
+def detect_person(frame, depth, K, scale):
+    """Detect the largest full body; return (row, distance, (u, v)) or None."""
+    global AIM_LANDMARKER
+    if frame is None:
+        return None
+    if AIM_LANDMARKER is None:
+        AIM_LANDMARKER = make_image_landmarker()
+    h, w = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = AIM_LANDMARKER.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+    if not res.pose_landmarks:
+        return None
+    lms = res.pose_landmarks[0]
+    row = extract(lms, w, h)
+    if row is None:
+        return None
+    dist = None
+    if depth is not None and K is not None:
+        add_depth(row, depth, K, scale)
+        if np.isfinite(row.get("dist_m", np.nan)):
+            dist = row["dist_m"]
+    sh = row.get("px_hip")
+    if sh is None:
+        return None
+    u = (row["px_hip"][0] + row["px_ls"][0] + row["px_rs"][0]) / 3.0
+    v = (row["px_ls"][1] + row["px_rs"][1] + row["px_lh"][1] + row["px_rh"][1]) / 4.0
+    return row, dist, (u, v)
+
+
+def set_track(**kw):
+    with TRACK_LOCK:
+        STATE.update(kw)
+
+
+def aim_robot(target=None, tol=0.45, timeout=40.0):
+    """Drive to the working distance and aim the head at the person.
+
+    Runs before a capture so the walk happens at 2-3 m with the full body in
+    frame.  The base does *not* move during the capture itself: only the head
+    pans, which the body-frame measurement is invariant to.
+    """
+    target = float(target or TARGET_DISTANCE)
+    tracker = get_tracker()
+    set_track(aiming=True, track_message="正在寻找站立位置")
+    t0 = time.time()
+    last = None
+    try:
+        while time.time() - t0 < timeout:
+            if tracker.fails >= 6:
+                set_track(aiming=False,
+                          track_message="机器人未连接：请先启动 robot_api.py（8090）")
+                return
+            src = get_track_source()
+            frame = src.read()
+            depth, K = src.read_depth()
+            person = detect_person(frame, depth, K, src.depth_scale)
+            if person is None:
+                # Search: sweep the head left/right until a body appears.
+                tracker.head(dpan=10.0 * tracker.search_dir)
+                tracker.search_dir *= -1.0
+                set_track(track_message="没看到全身，正在左右寻找")
+                time.sleep(0.8)
+                continue
+            row, dist, (u, v) = person
+            h, w = frame.shape[:2]
+            ex = (u - w / 2.0) / w
+            set_track(distance_m=None if dist is None else round(dist, 2))
+            last = (row, dist, ex)
+            if dist is not None:
+                if dist > target + tol:
+                    dur = float(np.clip((dist - target) / 0.05, 0.3, 2.5))
+                    set_track(track_message=f"距离 {dist:.1f} m，向前靠近")
+                    tracker.drive(0.05, 0.0, dur)
+                    time.sleep(dur + 0.35)
+                    continue
+                if dist < target - tol:
+                    dur = float(np.clip((target - dist) / 0.05, 0.3, 2.5))
+                    set_track(track_message=f"距离 {dist:.1f} m，向后退一点")
+                    tracker.drive(-0.05, 0.0, dur)
+                    time.sleep(dur + 0.35)
+                    continue
+            if abs(ex) > 0.05:
+                tracker.step(u, v, w, h, v_frac=0.45, adapt=True)
+                set_track(track_message=f"正在对准您（偏差 {ex * 100:+.0f}%）")
+                time.sleep(0.25)
+                continue
+            if dist is not None and abs(dist - target) <= tol and abs(ex) <= 0.05:
+                set_track(aiming=False,
+                          track_message=f"已就位：距离 {dist:.1f} m，可以开始采集")
+                return
+            time.sleep(0.2)
+        msg = "自动取景超时"
+        if last is not None and last[1] is not None:
+            msg += f"（最后距离 {last[1]:.1f} m）"
+        set_track(aiming=False, track_message=msg + "，可手动调整后采集")
+    except Exception as e:
+        traceback.print_exc()
+        set_track(aiming=False, track_message=f"取景失败: {type(e).__name__}: {e}")
+
+
+def body_center(lms, w, h):
+    """Torso centre from raw pose landmarks (works for upper-body views).
+
+    Returns ((u, v), v_frac, visibility) or None.  Unlike ``extract`` this does
+    not require the full body, so it can track someone sitting or standing
+    close to the camera.
+    """
+    def pt(i, min_vis=0.4):
+        p = lms[i]
+        if getattr(p, "visibility", 0.0) < min_vis:
+            return None
+        return np.array([p.x * w, p.y * h], dtype=float)
+
+    pts = [pt(i) for i in (11, 12, 23, 24)]
+    pts = [p for p in pts if p is not None]
+    if len(pts) >= 2:
+        c = np.mean(pts, axis=0)
+        return c, 0.45, 1.0
+    nose = pt(0, 0.3)
+    if nose is not None:
+        return nose, 0.33, 0.5
+    return None
+
+
+def idle_track_loop():
+    """Keep the head on the person while idle (visible camera motion)."""
+    while True:
+        try:
+            if (STATE.get("track") and not STATE.get("running")
+                    and not STATE.get("aiming")):
+                tracker = get_tracker()
+                if tracker.fails >= 5:
+                    set_track(track_message="机器人未连接：请先启动 "
+                                            "robot_api.py（8090）")
+                    time.sleep(1.5)
+                    continue
+                src = get_track_source()
+                frame = src.read()
+                depth, K = src.read_depth()
+                if frame is not None:
+                    h, w = frame.shape[:2]
+                    global AIM_LANDMARKER
+                    if AIM_LANDMARKER is None:
+                        AIM_LANDMARKER = make_image_landmarker()
+                    res = AIM_LANDMARKER.detect(mp.Image(
+                        image_format=mp.ImageFormat.SRGB,
+                        data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+                    target = None
+                    if res.pose_landmarks:
+                        target = body_center(res.pose_landmarks[0], w, h)
+                    if target is not None:
+                        (u, v), v_frac, _ = target
+                        tracker.step(u, v, w, h, v_frac=v_frac,
+                                     kp=(8.0, 5.0), adapt=True)
+                        if depth is not None and K is not None:
+                            z = depth_patch(depth, u, v, radius=8,
+                                            scale=src.depth_scale)
+                            if np.isfinite(z):
+                                set_track(distance_m=round(z, 2))
+                        set_track(track_message="头部跟随中")
+                    else:
+                        set_track(track_message="没有看到人，头部保持不动")
+        except Exception:
+            traceback.print_exc()
+        time.sleep(0.15)
+
+
+
 
 def point(lms, idx, w, h, min_vis=0.3):
     p = lms[idx]
@@ -249,6 +538,10 @@ def extract(lms, w, h):
         "px_hip": hip_mid,
         "px_ankle_l": p["LA"],
         "px_ankle_r": p["RA"],
+        "px_ls": p["LS"],
+        "px_rs": p["RS"],
+        "px_lh": p["LH"],
+        "px_rh": p["RH"],
     }
 
 
@@ -268,18 +561,26 @@ def depth_patch(depth, u, v, radius=6, scale=0.001, lo=0.15, hi=9.0):
     return float(np.median(patch))
 
 
+def _unproject(u, v, z, K):
+    """Pixel + metric depth -> 3D point in the camera frame (metres)."""
+    fx, fy, cx, cy = K
+    return np.array([(u - cx) * z / fx, (v - cy) * z / fy, z], dtype=float)
+
+
 def add_depth(row, depth, K, scale=0.001):
     """Attach metric depth features to one pose row.
 
-    Uses the aligned depth map sampled at the hip and both ankles:
+    Two coordinate sets are produced:
 
-      * ``dist_m``      body distance from the camera (hip midpoint)
-      * ``foot_l_x/z``  ankle position in metres in the camera frame
-      * ``hip_x_m``     hip lateral position in metres
+    1. **Body frame** (preferred, robust to camera motion).  Shoulders, hips and
+       ankles are unprojected to 3D with their own depth; the body's up and
+       lateral axes give the facing direction ``fwd``; the foot excursion is
+       ``(ankle - hip_mid) . fwd``.  Because both the foot vector and the axis
+       live in the same camera frame, panning/tilting/driving the robot does
+       not change this number.
 
-    Forward foot excursion relative to the body is computed in ``analyze``
-    after choosing the walking axis, so it works whether the person walks
-    towards the camera or across the frame.
+    2. **Camera axis** (fallback).  Foot depth relative to the hip along the
+       dominant camera axis.  Only valid when the camera is static.
     """
     fx, fy, cx, cy = K
     hip = row.get("px_hip")
@@ -287,9 +588,13 @@ def add_depth(row, depth, K, scale=0.001):
     ra = row.get("px_ankle_r")
     if hip is None or la is None or ra is None:
         return row
-    z_hip = depth_patch(depth, hip[0], hip[1], radius=10, scale=scale)
-    z_l = depth_patch(depth, la[0], la[1], radius=5, scale=scale)
-    z_r = depth_patch(depth, ra[0], ra[1], radius=5, scale=scale)
+
+    def dz(px, radius):
+        return depth_patch(depth, px[0], px[1], radius=radius, scale=scale)
+
+    z_hip = dz(hip, 10)
+    z_l = dz(la, 5)
+    z_r = dz(ra, 5)
     row["dist_m"] = z_hip
     row["hip_x_m"] = (float(hip[0]) - cx) * z_hip / fx
     row["foot_l_z"] = z_l
@@ -297,6 +602,48 @@ def add_depth(row, depth, K, scale=0.001):
     row["foot_l_x"] = (float(la[0]) - cx) * z_l / fx
     row["foot_r_x"] = (float(ra[0]) - cx) * z_r / fx
     row["hip_z_m"] = z_hip
+
+    # ---- body frame (camera-motion invariant) ---------------------------
+    px = {k: row.get(f"px_{k}") for k in ("ls", "rs", "lh", "rh")}
+    if any(v is None for v in px.values()) or not np.isfinite(z_hip):
+        return row
+    z_ls, z_rs = dz(px["ls"], 8), dz(px["rs"], 8)
+    z_lh, z_rh = dz(px["lh"], 8), dz(px["rh"], 8)
+    zs = {"ls": z_ls, "rs": z_rs, "lh": z_lh, "rh": z_rh}
+    used_fallback = False
+    for name, val in list(zs.items()):
+        if not np.isfinite(val):
+            zs[name] = z_hip
+            used_fallback = True
+    P = lambda pxk, z: _unproject(float(px[pxk][0]), float(px[pxk][1]), z, K)
+    p_ls, p_rs = P("ls", zs["ls"]), P("rs", zs["rs"])
+    p_lh, p_rh = P("lh", zs["lh"]), P("rh", zs["rh"])
+    sh_mid = (p_ls + p_rs) / 2.0
+    hip_mid = (p_lh + p_rh) / 2.0
+    up = sh_mid - hip_mid
+    n_up = np.linalg.norm(up)
+    if n_up < 1e-3:
+        return row
+    up = up / n_up
+    right = p_rs - p_ls
+    right = right - np.dot(right, up) * up
+    n_right = np.linalg.norm(right)
+    if n_right < 1e-3:
+        return row
+    right = right / n_right
+    fwd = np.cross(up, right)
+    fwd = fwd - np.dot(fwd, up) * up
+    n_fwd = np.linalg.norm(fwd)
+    if n_fwd < 1e-3:
+        return row
+    fwd = fwd / n_fwd
+    p_la = _unproject(float(la[0]), float(la[1]),
+                      z_l if np.isfinite(z_l) else z_hip, K)
+    p_ra = _unproject(float(ra[0]), float(ra[1]),
+                      z_r if np.isfinite(z_r) else z_hip, K)
+    row["bf_l"] = float(np.dot(p_la - hip_mid, fwd))
+    row["bf_r"] = float(np.dot(p_ra - hip_mid, fwd))
+    row["bf_valid"] = not used_fallback
     return row
 
 
@@ -357,15 +704,27 @@ def analyze(series, duration, fps):
     return metrics
 
 
+def _excursion(values, lo=0.02, hi=1.2):
+    v = values[np.isfinite(values)]
+    if v.size < 8:
+        return None
+    span = float(np.percentile(v, 95) - np.percentile(v, 5))
+    if lo < span < hi:
+        return span
+    return None
+
+
 def metric_depth_metrics(series):
     """Metre-scale distance and step length from the aligned D455 depth.
 
-    The walking axis is chosen per session (depth axis Z or lateral axis X)
-    so that walking towards the robot and walking across the frame both work.
+    Preferred estimate: **body frame**.  Each foot's forward offset from the
+    hip midpoint is measured along the person's own facing direction, so the
+    value is invariant to the robot panning, tilting or driving during the
+    walk.  That is what makes an actively moving head camera usable for
+    metric gait measurement.
 
-    Step length is the peak-to-peak excursion of each foot relative to the
-    body along the walking axis, averaged over both feet. It is an estimate
-    from monocular depth, not a motion-capture measurement.
+    Fallback: camera axis.  Foot depth (or lateral metres) relative to the
+    body along the dominant camera axis; only valid for a static camera.
     """
     out = {}
     z = np.array([s.get("dist_m", np.nan) for s in series], dtype=float)
@@ -380,30 +739,36 @@ def metric_depth_metrics(series):
         return out
     out["depth_used"] = True
     out["distance_m"] = round(float(np.median(z_ok)), 2)
+
+    # --- preferred: body frame -----------------------------------------
+    bf_l = np.array([s.get("bf_l", np.nan) for s in series], dtype=float)
+    bf_r = np.array([s.get("bf_r", np.nan) for s in series], dtype=float)
+    body_frames = int(np.isfinite(bf_l).sum())
+    out["body_frames"] = body_frames
+    spans = [s for s in (_excursion(bf_l), _excursion(bf_r)) if s is not None]
+    if spans:
+        out["step_length_m"] = round(float(np.mean(spans)), 2)
+        out["step_length_basis"] = "body_frame"
+        out["walk_axis"] = "body"
+        out["foot_excursion_m"] = [round(v, 2) for v in spans]
+
+    # --- fallback: camera axis -----------------------------------------
     z_span = float(np.nanmax(z_ok) - np.nanmin(z_ok))
     hx_ok = hx[np.isfinite(hx)]
     x_span = float(np.nanmax(hx_ok) - np.nanmin(hx_ok)) if hx_ok.size >= 5 else 0.0
     axis = "z" if z_span >= x_span else "x"
-    out["walk_axis"] = axis
     body = z if axis == "z" else hx
-    ex_l = np.array([s.get("foot_l_z", np.nan) for s in series], dtype=float) \
-        if axis == "z" else np.array([s.get("foot_l_x", np.nan) for s in series], dtype=float)
-    ex_r = np.array([s.get("foot_r_z", np.nan) for s in series], dtype=float) \
-        if axis == "z" else np.array([s.get("foot_r_x", np.nan) for s in series], dtype=float)
-    lengths = []
-    for ex in (ex_l, ex_r):
-        fwd = body - ex
-        fwd = fwd[np.isfinite(fwd)]
-        if fwd.size < 8:
-            continue
-        span = float(np.percentile(fwd, 95) - np.percentile(fwd, 5))
-        if 0.02 < span < 1.2:          # reject noise and tracking jumps
-            lengths.append(span)
-    if lengths:
-        out["step_length_m"] = round(float(np.mean(lengths)), 2)
-        out["foot_excursion_m"] = [round(v, 2) for v in lengths]
-    else:
-        out["step_length_m"] = None
+    ex_l = np.array([s.get(f"foot_l_{axis}", np.nan) for s in series], dtype=float)
+    ex_r = np.array([s.get(f"foot_r_{axis}", np.nan) for s in series], dtype=float)
+    cam_spans = [s for s in (_excursion(body - ex_l), _excursion(body - ex_r))
+                 if s is not None]
+    out["walk_axis_cam"] = axis
+    out["step_length_cam_axis_m"] = (round(float(np.mean(cam_spans)), 2)
+                                     if cam_spans else None)
+    if "step_length_m" not in out:
+        out["step_length_m"] = out["step_length_cam_axis_m"]
+        out["step_length_basis"] = "camera_axis" if out["step_length_m"] else None
+        out["walk_axis"] = axis if out["step_length_m"] else None
     return out
 
 
@@ -476,6 +841,16 @@ def run_capture(source, duration, fps):
                             add_depth(row, depth, K, src.depth_scale)
                             if np.isfinite(row.get("dist_m", np.nan)):
                                 depth_ok += 1
+                                with LOCK:
+                                    STATE["distance_m"] = round(
+                                        float(row["dist_m"]), 2)
+                        if STATE.get("track"):
+                            u = (row["px_hip"][0] + row["px_ls"][0]
+                                 + row["px_rs"][0]) / 3.0
+                            v = (row["px_ls"][1] + row["px_rs"][1]
+                                 + row["px_lh"][1] + row["px_rh"][1]) / 4.0
+                            get_tracker().step(u, v, w, h, v_frac=0.42,
+                                               adapt=False)
                         series.append(row)
                         last_overlay = draw_overlay(frame, lms)
                 with LOCK:
@@ -768,6 +1143,30 @@ def stop():
     return jsonify({"ok": True})
 
 
+@app.post("/api/track")
+def api_track():
+    data = request.get_json(force=True, silent=True) or {}
+    on = bool(data.get("on", True))
+    set_track(track=on,
+              track_message="头部跟随已开启" if on else "头部跟随已关闭")
+    if not on:
+        try:
+            get_tracker().head(center=True)
+        except Exception:
+            pass
+    return jsonify({"ok": True, "track": on})
+
+
+@app.post("/api/aim")
+def api_aim():
+    if STATE.get("aiming"):
+        return jsonify({"ok": False, "error": "already aiming"}), 409
+    data = request.get_json(force=True, silent=True) or {}
+    target = float(data.get("target", TARGET_DISTANCE))
+    threading.Thread(target=aim_robot, args=(target,), daemon=True).start()
+    return jsonify({"ok": True, "target": target})
+
+
 @app.get("/api/history")
 def api_history():
     with sqlite3.connect(DB_PATH) as db:
@@ -806,6 +1205,8 @@ h1{font-size:22px;margin:0 0 14px}
 .card{background:#1d1d1f;border-radius:12px;padding:16px}
 button{font-size:17px;padding:13px 18px;margin:5px;border:0;border-radius:10px;cursor:pointer}
 .prep{background:#36c;color:#fff}.start{background:#2a8;color:#fff}.stop{background:#d33;color:#fff}
+.aim{background:#963;color:#fff}.track{background:#3a7;color:#fff}
+.track.on{background:#0a5}
 button:disabled{opacity:.5;cursor:default}
 img{width:100%;background:#000;border-radius:8px;margin-top:8px}
 #bar{height:10px;background:#333;border-radius:5px;overflow:hidden;margin:10px 0}
@@ -829,12 +1230,16 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
     <button class="prep" onclick="prepare()">准备（停车）</button>
     <button class="start" onclick="startCapture()">开始采集 10 秒</button>
     <button class="stop" onclick="stopCapture()">停止</button>
+    <button class="aim" onclick="aim()">自动取景（走到 2–3 米）</button>
+    <button id="btn_track" class="track" onclick="toggleTrack()">头部跟随：关</button>
+    <div id="track_msg" style="font-size:13px;color:#9cf;margin:6px 0">机器人未连接时仅能采集，不能自动取景。</div>
     <div id="bar"><div id="fill"></div></div>
     <div id="msg">请让老人站在头部相机前，露出全身；距离 2–3 米。</div>
     <img id="live" src="http://127.0.0.1:8080/stream/head">
     <small>实时头部相机 D455（彩色 + 对齐深度）</small>
     <table id="metrics">
       <tr><td>状态</td><td id="m_status">未开始</td></tr>
+      <tr><td>当前距离（米）</td><td id="m_live_dist">-</td></tr>
       <tr><td>步数</td><td id="m_steps">-</td></tr>
       <tr><td>步频 (步/分)</td><td id="m_cadence">-</td></tr>
       <tr><td>左/右膝平均角</td><td id="m_knee">-</td></tr>
@@ -874,6 +1279,20 @@ async function startCapture(){
   poll();
 }
 async function stopCapture(){ await fetch('/api/stop',{method:'POST'}); }
+async function aim(){
+  const r=await fetch('/api/aim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:2.6})});
+  const j=await r.json();
+  if(j.error) document.getElementById('track_msg').textContent=j.error;
+  else poll();
+}
+let tracking=false;
+async function toggleTrack(){
+  tracking=!tracking;
+  await fetch('/api/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:tracking})});
+  const b=document.getElementById('btn_track');
+  b.textContent='头部跟随：'+(tracking?'开':'关');
+  b.classList.toggle('on',tracking);
+}
 function set(id,v){ document.getElementById(id).textContent=v; }
 let lastSession=null;
 function renderLatest(l){
@@ -918,14 +1337,23 @@ async function loadSession(id){
     if(j.latest) renderLatest(j.latest);
   }catch(e){}
 }
+let pollTimer=null;
 async function poll(){
   try{
     const r=await fetch('/api/status'); const j=await r.json();
     document.getElementById('fill').style.width=Math.round((j.progress||0)*100)+'%';
     if(j.error) document.getElementById('msg').textContent=j.error;
+    if(j.track_message) document.getElementById('track_msg').textContent=j.track_message;
+    if(j.distance_m!==null && j.distance_m!==undefined)
+      document.getElementById('m_live_dist').textContent=j.distance_m+' m';
+    tracking=!!j.track;
+    const b=document.getElementById('btn_track');
+    b.textContent='头部跟随：'+(tracking?'开':'关');
+    b.classList.toggle('on',tracking);
     if(j.latest) renderLatest(j.latest);
-    if(j.running) setTimeout(poll,700);
   }catch(e){}
+  clearTimeout(pollTimer);
+  pollTimer=setTimeout(poll, 1200);
 }
 poll(); loadHistory();
 </script></body></html>
@@ -933,19 +1361,28 @@ poll(); loadHistory();
 
 
 def main():
-    global LANDMARKER
+    global LANDMARKER, TARGET_DISTANCE
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8084)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--source", default=DEFAULT_SOURCE)
     ap.add_argument("--duration", type=float, default=10.0)
+    ap.add_argument("--track", action="store_true",
+                    help="start with head tracking enabled")
+    ap.add_argument("--target-distance", type=float, default=2.6,
+                    help="auto-framing distance in metres")
     args = ap.parse_args()
     STATE["source"] = args.source
     STATE["duration"] = args.duration
+    STATE["track"] = bool(args.track)
+    TARGET_DISTANCE = args.target_distance
     init_db()
     load_latest_result()
     LANDMARKER = make_landmarker()
+    threading.Thread(target=idle_track_loop, daemon=True).start()
     print(f"health station on http://{args.host}:{args.port}", flush=True)
+    print(f"source: {args.source}; track={STATE['track']}; "
+          f"target={TARGET_DISTANCE} m", flush=True)
     print(f"source: {args.source}", flush=True)
     app.run(host=args.host, port=args.port, threaded=True)
 
