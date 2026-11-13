@@ -221,14 +221,20 @@ class HeadClient:
 
     def __init__(self, api=ROBOT_API):
         self.api = api.rstrip("/")
-        self.pan_sign = 1.0
-        self.tilt_sign = 1.0
+        # Measured on the XLeRobot 0.4.0 head: a positive dpan turns the camera
+        # right and a negative dtilt tilts it up, so these are the signs that
+        # reduce a pixel error on the first try.  ``adapt`` still flips them if
+        # a differently assembled head disagrees.
+        self.pan_sign = -1.0
+        self.tilt_sign = -1.0
         self._prev = None
-        self._worse = 0
+        self._worse_pan = 0
+        self._worse_tilt = 0
         self.fails = 0
         self.search_dir = 1.0
         self.pan = 0.0
         self.tilt = 0.0
+        self._last_cmd = 0.0
 
     def available(self):
         return self.fails < 5
@@ -263,21 +269,33 @@ class HeadClient:
         return self._post("/drive", {"x": x, "theta": theta,
                                      "duration": duration}, timeout=2.0)
 
-    def step(self, u, v, w, h, v_frac=0.5, kp=(9.0, 6.0), dead=0.02,
+    def step(self, u, v, w, h, v_frac=0.5, kp=(34.0, 45.0), dead=0.02,
              adapt=False):
         """Move the head so the target pixel moves toward (w/2, v_frac*h)."""
         ex = (u - w / 2.0) / float(w)
         ey = (v - v_frac * h) / float(h)
         if adapt and self._prev is not None:
+            # Each axis is corrected independently: a pan command can only be
+            # judged by the horizontal error, a tilt command only by the
+            # vertical one.
             if abs(ex) > abs(self._prev[0]) + 0.01:
-                self._worse += 1
-                if self._worse >= 3:
+                self._worse_pan += 1
+                if self._worse_pan >= 3:
                     self.pan_sign *= -1.0
-                    self._worse = 0
+                    self._worse_pan = 0
                     self._prev = None
                     return False
             else:
-                self._worse = 0
+                self._worse_pan = 0
+            if abs(ey) > abs(self._prev[1]) + 0.01:
+                self._worse_tilt += 1
+                if self._worse_tilt >= 3:
+                    self.tilt_sign *= -1.0
+                    self._worse_tilt = 0
+                    self._prev = None
+                    return False
+            else:
+                self._worse_tilt = 0
         self._prev = (ex, ey)
         dpan = 0.0 if abs(ex) < dead else -self.pan_sign * kp[0] * ex
         dtilt = 0.0 if abs(ey) < dead else -self.tilt_sign * kp[1] * ey
@@ -285,10 +303,15 @@ class HeadClient:
         dtilt = float(np.clip(dtilt, -8.0, 8.0))
         if dpan == 0.0 and dtilt == 0.0:
             return True
+        # Do not stack commands: the servo needs time to physically move, so a
+        # second command based on an already-stale frame would overshoot.
+        if time.monotonic() - self._last_cmd < 0.20:
+            return True
         ok = self.head(dpan=dpan, dtilt=dtilt)
         if ok:
-            self.pan = float(np.clip(self.pan + dpan, -70, 70))
-            self.tilt = float(np.clip(self.tilt + dtilt, -30, 30))
+            self._last_cmd = time.monotonic()
+            self.pan = float(np.clip(self.pan + dpan, -98, 98))
+            self.tilt = float(np.clip(self.tilt + dtilt, -98, 98))
         return ok
 
 
@@ -317,8 +340,8 @@ class BaseFollower:
 
     MIN_FORWARD_M = 0.85     # never drive forward closer than this
     HARD_STOP_M = 0.60       # below this, back away
-    MAX_FORWARD = 0.12       # m/s, approaching a person
-    MAX_BACK = 0.20          # m/s, retreating (still slower than walking)
+    MAX_FORWARD = 0.30       # m/s, approaching a person (normal walking)
+    MAX_BACK = 0.22          # m/s, retreating (still slower than walking)
     DEADBAND = 0.15          # m
 
     def __init__(self, api=ROBOT_API):
@@ -395,7 +418,7 @@ def get_follower():
     return FOLLOWER
 
 
-def min_full_body_distance(row, dist, fy, frame_h, fill=0.85):
+def min_full_body_distance(row, dist, fy, frame_h, fill=0.78):
     """Smallest distance at which this person still fits in the frame.
 
     Uses the nose-to-ankle pixel span and the measured depth to recover the
@@ -442,13 +465,23 @@ def detect_person(frame, depth, K, scale):
         return None
     lms = res.pose_landmarks[0]
     row = extract(lms, w, h)
-    if row is None:
-        return None
     dist = None
-    if depth is not None and K is not None:
-        add_depth(row, depth, K, scale)
-        if np.isfinite(row.get("dist_m", np.nan)):
-            dist = row["dist_m"]
+    if row is not None:
+        if depth is not None and K is not None:
+            add_depth(row, depth, K, scale)
+            if np.isfinite(row.get("dist_m", np.nan)):
+                dist = row["dist_m"]
+    else:
+        # Only part of the body is visible.  Still report the torso so the
+        # head can tilt until the full body enters the frame instead of
+        # sweeping sideways forever.
+        c = body_center(lms, w, h)
+        if c is None:
+            return None
+        (u, v), _, _ = c
+        if depth is not None and K is not None:
+            dist = torso_distance(lms, depth, K, scale, w, h)
+        return None, dist, (u, v)
     sh = row.get("px_hip")
     if sh is None:
         return None
@@ -485,15 +518,20 @@ def aim_robot(target=None, tol=0.45, timeout=40.0):
             depth, K = src.read_depth()
             person = detect_person(frame, depth, K, src.depth_scale)
             if person is None:
-                # Search: sweep the head left/right until a body appears.
-                tracker.head(dpan=10.0 * tracker.search_dir)
+                # Search: alternate a downward tilt with a horizontal sweep so
+                # a person standing below the current view is found too.
+                if tracker.search_dir > 0:
+                    tracker.head(dtilt=8.0)
+                else:
+                    tracker.head(dpan=10.0 * tracker.search_dir)
                 tracker.search_dir *= -1.0
-                set_track(track_message="没看到全身，正在左右寻找")
+                set_track(track_message="没看到全身，正在调整视角寻找")
                 time.sleep(0.8)
                 continue
             row, dist, (u, v) = person
             h, w = frame.shape[:2]
             ex = (u - w / 2.0) / w
+            ey = (v - 0.45 * h) / h
             set_track(distance_m=None if dist is None else round(dist, 2))
             last = (row, dist, ex)
             if dist is not None:
@@ -509,12 +547,16 @@ def aim_robot(target=None, tol=0.45, timeout=40.0):
                     tracker.drive(-0.05, 0.0, dur)
                     time.sleep(dur + 0.35)
                     continue
-            if abs(ex) > 0.05:
+            if abs(ex) > 0.05 or abs(ey) > 0.08:
                 tracker.step(u, v, w, h, v_frac=0.45, adapt=True)
-                set_track(track_message=f"正在对准您（偏差 {ex * 100:+.0f}%）")
+                set_track(track_message=(
+                    f"正在对准您（水平 {ex * 100:+.0f}% / "
+                    f"垂直 {ey * 100:+.0f}%）"))
                 time.sleep(0.25)
                 continue
-            if dist is not None and abs(dist - target) <= tol and abs(ex) <= 0.05:
+            if (row is not None and dist is not None
+                    and abs(dist - target) <= tol
+                    and abs(ex) <= 0.05 and abs(ey) <= 0.08):
                 set_track(aiming=False,
                           track_message=f"已就位：距离 {dist:.1f} m，可以开始采集")
                 return
@@ -552,6 +594,25 @@ def body_center(lms, w, h):
     return None
 
 
+def torso_distance(lms, depth, K, scale, w, h):
+    """Median depth at the torso, usable even when the full body is out of view.
+
+    Full-body ``extract`` rejects frames with a knee or ankle outside the image,
+    which happens while walking.  The base follower must not stop for that
+    reason, so it falls back to the four torso joints.
+    """
+    if depth is None or K is None:
+        return None
+    zs = []
+    for i in (11, 12, 23, 24):
+        p = lms[i]
+        if getattr(p, "visibility", 0.0) >= 0.4:
+            z = depth_patch(depth, p.x * w, p.y * h, radius=8, scale=scale)
+            if np.isfinite(z):
+                zs.append(z)
+    return float(np.median(zs)) if zs else None
+
+
 def idle_track_loop():
     """Keep the head on the person while idle (visible camera motion)."""
     while True:
@@ -581,7 +642,7 @@ def idle_track_loop():
                     if target is not None:
                         (u, v), v_frac, _ = target
                         tracker.step(u, v, w, h, v_frac=v_frac,
-                                     kp=(8.0, 5.0), adapt=True)
+                                     kp=(30.0, 40.0), adapt=True)
                         if depth is not None and K is not None:
                             z = depth_patch(depth, u, v, radius=8,
                                             scale=src.depth_scale)
@@ -794,7 +855,10 @@ def analyze(series, duration, fps):
         return None
     def arr(key):
         return np.array([s.get(key, np.nan) for s in series], dtype=float)
-    t = np.arange(len(series)) / max(fps, 1e-6)
+    ts = np.array([s.get("t", np.nan) for s in series], dtype=float)
+    uniform = (np.isfinite(ts).all() and len(series) > 2
+               and ts[-1] - ts[0] > 0.5)
+    t = ts if uniform else np.arange(len(series)) / max(fps, 1e-6)
     kL, kR = arr("knee_l"), arr("knee_r")
     hL, hR = arr("hip_l"), arr("hip_r")
     trunk = arr("trunk")
@@ -809,10 +873,23 @@ def analyze(series, duration, fps):
     # the base moves during the capture.
     if np.isfinite(bf_l).sum() >= 8 and np.isfinite(bf_r).sum() >= 8:
         step_detector = "depth_body_frame"
+        # Frames can be dropped while the person is partly out of view, so the
+        # samples are not evenly spaced.  Resample onto the nominal fps grid
+        # first, otherwise a "minimum 0.35 s between peaks" rule in *samples*
+        # miscounts steps whenever the accept rate changes.
+        sig_l, sig_r = bf_l, bf_r
+        if uniform:
+            grid = np.arange(ts[0], ts[-1] + 1e-9, 1.0 / max(fps, 1e-6))
+            def on_grid(v):
+                ok = np.isfinite(v)
+                if ok.sum() < 3:
+                    return v
+                return np.interp(grid, ts[ok], v[ok])
+            sig_l, sig_r = on_grid(bf_l), on_grid(bf_r)
         try:
-            step_count = int(len(find_peaks(_fill_nan(bf_l), distance=min_gap,
+            step_count = int(len(find_peaks(_fill_nan(sig_l), distance=min_gap,
                                             prominence=0.04)[0]) +
-                             len(find_peaks(_fill_nan(bf_r), distance=min_gap,
+                             len(find_peaks(_fill_nan(sig_r), distance=min_gap,
                                             prominence=0.04)[0]))
         except Exception:
             step_count = 0
@@ -825,11 +902,13 @@ def analyze(series, duration, fps):
             step_count = 0
     sym = float(np.nanmean(np.abs(kL - kR)) /
                 max(1e-6, np.nanmean((kL + kR) / 2)) * 100)
+    span = float(ts[-1] - ts[0]) if uniform else duration
     metrics = {
         "frames": len(series),
+        "frame_ratio": round(len(series) / max(1.0, duration * fps), 2),
         "duration_s": round(duration, 2),
         "step_count": step_count,
-        "cadence_spm": round(step_count / max(duration, 1e-6) * 60, 1),
+        "cadence_spm": round(step_count / max(span, 1e-6) * 60, 1),
         "knee_left_mean_deg": round(float(np.nanmean(kL)), 1),
         "knee_right_mean_deg": round(float(np.nanmean(kR)), 1),
         "knee_left_range_deg": round(float(np.nanmax(kL) - np.nanmin(kL)), 1),
@@ -917,7 +996,11 @@ def metric_depth_metrics(series):
 
 
 def plot_gait(series, fps, path):
-    t = np.arange(len(series)) / max(fps, 1e-6)
+    ts = np.array([s.get("t", np.nan) for s in series], dtype=float)
+    if np.isfinite(ts).all() and len(series) > 2:
+        t = ts
+    else:
+        t = np.arange(len(series)) / max(fps, 1e-6)
     def a(k):
         return np.array([s.get(k, np.nan) for s in series], dtype=float)
     fwd_l = a("dist_m") - a("foot_l_z")
@@ -961,6 +1044,8 @@ def run_capture(source, duration, fps):
     series = []
     last_overlay = None
     start = time.time()
+    period = 1.0 / max(fps, 1.0)
+    frame_i = 0
     lm = LANDMARKER
     follow = bool(STATE.get("follow"))
     requested = float(STATE.get("follow_distance") or 1.0)
@@ -982,11 +1067,13 @@ def run_capture(source, duration, fps):
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                res = lm.detect_for_video(mp_img, int(elapsed * 1000) + 1)
+                res = lm.detect_for_video(
+                    mp_img, int(time.monotonic() * 1000))
                 if res.pose_landmarks:
                     lms = res.pose_landmarks[0]
                     row = extract(lms, w, h)
                     if row is not None:
+                        row["t"] = round(elapsed, 4)
                         depth, K = src.read_depth()
                         if depth is not None and K is not None:
                             add_depth(row, depth, K, src.depth_scale)
@@ -1027,13 +1114,22 @@ def run_capture(source, duration, fps):
                                                adapt=False)
                         series.append(row)
                         last_overlay = draw_overlay(frame, lms)
+                    else:
+                        # Legs/feet partly out of view: the gait frame is
+                        # rejected for accuracy, but the base must still hold
+                        # its standoff, so fall back to torso depth.
+                        depth, K = src.read_depth()
+                        dist_now = torso_distance(lms, depth, K,
+                                                  src.depth_scale, w, h)
                 with LOCK:
                     STATE["progress"] = min(1.0, elapsed / duration)
             # Keep the 1 m (or clamped) standoff. A missing person stops the
             # base immediately; the API lease also expires on its own.
             if follower is not None:
                 follower.update(dist_now)
-            time.sleep(max(0.0, 1.0 / fps - 0.005))
+            frame_i += 1
+            next_t = start + frame_i * period
+            time.sleep(max(0.0, next_t - time.time()))
         elapsed = time.time() - start
         if not series:
             with LOCK:
@@ -1168,12 +1264,17 @@ def make_report(m):
     step_m = m.get("step_length_m")
     step_m = float(step_m) if isinstance(step_m, (int, float)) else None
     depth_used = bool(m.get("depth_used"))
+    ratio = float(m.get("frame_ratio", 1.0) or 1.0)
 
-    if steps < 2 or dur < 2.5:
+    if ratio < 0.35 or steps < 2 or dur < 2.5:
         report = (
-            "本次采集没有形成连续步行，可能是站立、转身或人体未完整入镜。"
+            "本次采集没有形成连续步行，可能是站立、转身、人体未完整入镜，"
+            "或头部取景没有覆盖全身。"
             "这组数据不能用于步态风险判断，建议让老人自然走 5–10 步后重新采集。"
         )
+        if ratio < 0.35:
+            report += (f"\n（有效帧仅 {ratio * 100:.0f}%，请确认头、髋、膝、踝"
+                       "始终在画面内。）")
         if dist is not None:
             report += f"\n深度测得站位距离约 {dist:.1f} 米。"
         tips = [

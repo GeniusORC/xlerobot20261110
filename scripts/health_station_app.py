@@ -298,11 +298,13 @@ class App:
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                res = lm.detect_for_video(mp_img, int(elapsed * 1000) + 1)
+                res = lm.detect_for_video(
+                    mp_img, int(time.monotonic() * 1000))
                 if res.pose_landmarks:
                     lms = res.pose_landmarks[0]
                     row = hs.extract(lms, w, h)
                     if row is not None:
+                        row["t"] = round(elapsed, 4)
                         if depth is not None and K is not None:
                             hs.add_depth(row, depth, K, scale)
                             if np.isfinite(row.get("dist_m", np.nan)):

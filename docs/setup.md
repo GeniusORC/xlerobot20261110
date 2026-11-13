@@ -736,13 +736,19 @@ POST /drive {"x":..,"theta":..,"duration":..}   bounded fine positioning
 GET  /status                    -> also reports head/busy state
 ```
 
-Limits: the tracking window is ±70 pan / ±30 tilt **around the pose captured
-when the service connects** (not around absolute 0), so a head resting far from
-the midpoint is never commanded across the whole range. Each command moves at
-most 8 normalized units, and `center` ramps smoothly back to 0 (opt-in, can be
-a large move). Drive |x| ≤ 0.08 m/s, |theta| ≤ 25 °/s, duration ≤ 3 s. All bus
+Limits: each command moves at most 8 normalized units (a slew limit), and the
+only envelope is the calibrated motor range −98..98. An earlier version also
+clamped to ±30 tilt around the pose captured at connect time; that could trap
+the camera looking up at the ceiling with no way to tilt down, so the whole
+full-body capture failed. `center` ramps smoothly back to 0 (opt-in, can be a
+large move). Drive |x| ≤ 0.08 m/s, |theta| ≤ 25 °/s, duration ≤ 3 s. All bus
 access goes through one lock so the 10 Hz tracker, the voice commands and the
 status endpoint cannot interleave.
+
+Important: `POST /command {"intent":"stop"}` (called by the health station
+before every capture) sets the internal `STOP_EVENT`. Head commands now clear
+it explicitly — without that, the first capture of a session left the camera
+frozen for the rest of the session.
 
 `GET /head` reports the raw pose plus `pan_ref`/`tilt_ref` and the effective
 `pan_window`/`tilt_window`.
@@ -763,9 +769,29 @@ Without following, the base deliberately stays still during a capture. Run
 自动取景 first, then start the capture; §21 adds optional base following.
 
 The tracker closes the loop on pixels, so no motor-angle calibration is
-needed. If the pan direction is inverted on a given build, it detects the error
-growing over three updates and flips the sign automatically (only while the
-target is roughly still, never mid-walk).
+needed. On this build, a positive `dpan` turns the camera **right** and a
+negative `dtilt` tilts it **up**; those are the defaults. Each axis watches its
+own error and flips its own sign after three worsening updates, so a
+differently assembled head self-corrects. Commands are rate-limited to one per
+0.20 s so a move based on an already-stale frame cannot stack up and overshoot.
+During a capture the torso is held at 42 % of the frame height, which leaves
+room for head and feet.
+
+Two bugs made real captures produce nonsense (9 accepted frames and then a
+crash) and are now fixed:
+
+* MediaPipe `detect_for_video` needs a monotonically increasing timestamp.
+  The capture loop used `int(elapsed*1000)`, which restarted at 0 for every
+  capture and raised `ValueError: Input timestamp must be monotonically
+  increasing` on the second one. It now uses `time.monotonic()`.
+* Accepted frames are not evenly spaced (a frame is dropped whenever a knee or
+  ankle leaves the image). Step peaks are now detected after resampling onto
+  the nominal fps grid using each row's real timestamp, instead of assuming
+  contiguous samples.
+
+The report also refuses to score a capture when fewer than 35 % of the frames
+were usable, and says so, rather than printing a plausible-looking but wrong
+step length.
 
 ### 20.5 Hardware test
 

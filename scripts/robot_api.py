@@ -48,13 +48,15 @@ BUS_LOCK = threading.Lock()
 # Head pan/tilt are ordinary STS3215 position servos on bus1 (IDs 7 and 8).
 # Values are normalized to [-100, 100]; 0 is the calibration midpoint.
 #
-# The tracking envelope is *relative to the pose captured when the service
-# connects*, not absolute. A head that happens to rest far from the midpoint
-# (e.g. tilt -71) must not be commanded straight to 0, which would be a ~45
-# degree swing. Every command also moves at most MAX_STEP normalized units.
+# Every command moves at most MAX_STEP normalized units, so the head can never
+# make a violent jump even when it is far from the requested pose.  The only
+# real envelope is the calibrated motor range HARD_LIMIT; an earlier version
+# also clamped to +-30 around the pose captured at connect time, which trapped
+# the camera looking at the ceiling (tilt could only move one way) and made
+# full-body framing impossible.
 PAN_MOTOR, TILT_MOTOR = "head_motor_1", "head_motor_2"
-PAN_SPAN = 70.0               # tracking envelope around the reference pose
-TILT_SPAN = 30.0
+PAN_SPAN = 98.0               # full calibrated travel for both axes
+TILT_SPAN = 98.0
 HARD_LIMIT = (-98.0, 98.0)    # normalized motor range, 0 = calibration mid
 MAX_STEP = 8.0                # max normalized units per command
 HEAD_REF = {"pan": None, "tilt": None}
@@ -63,7 +65,7 @@ HEAD_REF = {"pan": None, "tilt": None}
 # moving only while the health station keeps refreshing this lease. Approaching
 # a person is slower than retreating from one.
 VEL = {"x": 0.0, "theta": 0.0, "lease": 0.0}
-VEL_LIMIT = (-0.20, 0.12)
+VEL_LIMIT = (-0.22, 0.30)   # forward raised so a normal walk can be followed
 
 
 def set_state(**kwargs):
@@ -298,6 +300,11 @@ def worker():
         if isinstance(intent, dict):
             kind = intent.get("type")
             if kind == "head":
+                # ``stop_robot()`` (called before every capture) sets
+                # STOP_EVENT, and nothing else clears it.  Without this the
+                # first head command after a capture aborts immediately and
+                # the camera never moves again.
+                STOP_EVENT.clear()
                 try:
                     res = _set_head(pan=intent.get("pan"),
                                     tilt=intent.get("tilt"),
