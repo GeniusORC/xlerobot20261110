@@ -360,6 +360,8 @@ def main():
                     help="connect already-paired Bluetooth Joy-Cons first")
     ap.add_argument("--takeover", action="store_true",
                     help="turn off the health station's follow mode first")
+    ap.add_argument("--verbose", action="store_true",
+                    help="print the velocity actually sent")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -503,6 +505,7 @@ def main():
         return max(-1.0, min(1.0, (raw - c) / span))
 
     sent = False
+    last_print = 0.0
     try:
         while not state.quit:
             if not all(t.is_alive() for t in readers):
@@ -522,6 +525,11 @@ def main():
                 th = -th
             vx = x * args.max_x
             vth = th * args.max_theta
+            if args.verbose and time.time() - last_print > 0.5:
+                if abs(vx) > 0.005 or abs(vth) > 0.2:
+                    print(f"x={vx:+.2f} m/s  theta={vth:+6.1f} deg/s",
+                          flush=True)
+                    last_print = time.time()
             if abs(vx) < 0.005 and abs(vth) < 0.2:
                 if sent:
                     post_velocity(0.0, 0.0, args.dry_run)
