@@ -228,6 +228,29 @@ def _drive(x: float, theta: float, duration: float):
     _move(x, theta, duration, "正在微调位置")
 
 
+def _move_relative(forward_m: float = 0.0, turn_deg: float = 0.0):
+    """Measured move for spoken commands ("往前走三十厘米", "左转九十度").
+
+    There are no wheel encoders we trust for closed-loop odometry, so the
+    distance is turned into a duration at a fixed speed.  Turning happens
+    first so the drive is in the direction the user asked for.
+    """
+    turn_deg = float(np.clip(turn_deg, -180.0, 180.0))
+    forward_m = float(np.clip(forward_m, -2.0, 2.0))
+
+    if abs(turn_deg) >= 5.0:
+        rate = 20.0  # deg/s
+        _move(0.0, rate if turn_deg > 0 else -rate,
+              min(abs(turn_deg) / rate, 9.0),
+              "正在左转" if turn_deg > 0 else "正在右转")
+
+    if abs(forward_m) >= 0.03:
+        speed = 0.20 if forward_m > 0 else 0.16
+        dur = min(abs(forward_m) / speed, 12.0)
+        _move(speed if forward_m > 0 else -speed, 0.0, dur,
+              "正在前进" if forward_m > 0 else "正在后退")
+
+
 def _look_at_person():
     """Rotate the base to center the largest detected face in the head camera."""
     STOP_EVENT.clear()
@@ -326,6 +349,10 @@ def worker():
                        float(intent.get("theta", 0.0)),
                        float(intent.get("duration", 0.5)))
                 continue
+            if kind == "move":
+                _move_relative(float(intent.get("forward_m", 0.0)),
+                               float(intent.get("turn_deg", 0.0)))
+                continue
             continue
         if intent == "report":
             set_state(busy=True, last_intent="report", message="正在读取状态")
@@ -418,6 +445,31 @@ def drive():
            "duration": float(data.get("duration", 0.5))}
     COMMANDS.put(cmd)
     return jsonify({"queued": "drive", **cmd})
+
+
+@app.post("/move")
+def move():
+    """Measured move: {"forward_m": 0.3, "turn_deg": 90}.
+
+    forward_m is positive forward, turn_deg is positive left.  This is what
+    spoken commands like "往前走三十厘米" or "左转九十度" map onto; it is
+    deliberately separate from /drive, which is limited to small corrections
+    for the health-station auto-framing.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    try:
+        fwd = float(data.get("forward_m", 0.0) or 0.0)
+        turn = float(data.get("turn_deg", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "forward_m and turn_deg must be numbers"}), 400
+    if abs(fwd) < 0.01 and abs(turn) < 1.0:
+        return jsonify({"error": "need forward_m or turn_deg"}), 400
+    fwd = float(np.clip(fwd, -2.0, 2.0))
+    turn = float(np.clip(turn, -180.0, 180.0))
+    COMMANDS.put({"type": "move", "forward_m": fwd, "turn_deg": turn})
+    return jsonify({"queued": "move", "forward_m": fwd, "turn_deg": turn})
 
 
 @app.post("/velocity")

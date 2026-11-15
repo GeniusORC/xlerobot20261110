@@ -1133,3 +1133,58 @@ Wiring that is already in place:
   so every spoken reply is lip-synced and leaves a matching expression.
 - `voice_auto_web.py` sets `listening` when VAD detects speech and `thinking`
   while the ASR/LLM turn runs.
+
+## 25. Tool-calling brain and measured moves
+
+Phase A of the omni-agent plan: the keyword intent table is no longer the
+router. `scripts/agent_brain.py` makes **one DeepSeek function-calling turn**
+per utterance. The model either calls a robot tool or answers in prose, so
+"聊天还是控车" and the wording come from the same context.
+
+Tools exposed to the model:
+
+| Tool | Args | Maps to |
+|---|---|---|
+| `stop_robot` | — | `POST /command {"intent":"stop"}` |
+| `move_robot` | `forward_m`, `turn_deg` | `POST /move` |
+| `come_here` | — | `POST /command {"intent":"come"}` |
+| `look_at_me` | — | `POST /command {"intent":"look"}` |
+| `report_status` | — | `POST /command {"intent":"report"}` |
+
+`forward_m` is positive forward, `turn_deg` is positive left. "往前走三十厘米"
+becomes `{"forward_m": 0.3}` instead of being flattened to a fixed-duration
+`forward`, and "左转九十度" becomes `{"turn_deg": 90}`.
+
+```bash
+curl -X POST 127.0.0.1:8090/move \
+  -H 'Content-Type: application/json' -d '{"forward_m":0.3,"turn_deg":0}'
+```
+
+`_move_relative()` turns first (20 deg/s), then drives (0.20 m/s forward,
+0.16 m/s back), clipped to 2 m and 180 deg. There is no trustworthy odometry,
+so distance is duration at a fixed speed; treat it as "about 30 cm".
+
+Safety and robustness rules that live in code, not in the prompt:
+
+1. **Emergency and crisis wording** is answered from the rule table and never
+   goes through the model.
+2. **"停下" is a hard keyword stop**: `map_intent(text) == "stop"` runs before
+   the model, so a chatty model can never talk instead of stopping.
+3. **Misfire guard**: if the model calls `move_robot` / `come_here` /
+   `look_at_me` on a sentence with no motion words, the turn is re-asked with
+   tools disabled. Without this, "我今天睡不好" once became a `move_robot`.
+4. **No false success**: when `robot_api` returns an error the reply is
+   "我这边连不上机器人，请检查电源和串口", never "好的，已停止".
+
+Long-term memory lives in the `facts` table of `data/chat/chat.db`
+(`key`, `value`, `updated_at`). After each user turn a background thread asks
+the model for durable facts (称呼、年龄、慢病、用药、家人) and upserts them; at
+most 12 are injected into the system prompt, and the table keeps 36 rows.
+Extraction never blocks the spoken reply.
+
+```bash
+sqlite3 data/chat/chat.db 'select key,value from facts'
+```
+
+Fallback chain when the LLM is unreachable: keyword table -> rule-based
+companion (`fallback_chat`). The service keeps talking offline.

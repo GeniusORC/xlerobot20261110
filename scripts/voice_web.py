@@ -28,6 +28,7 @@ from datetime import datetime
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
+import agent_brain
 import face_client as face
 from voice_loop import tts, transcribe, vad_trim
 
@@ -49,18 +50,6 @@ EMERGENCY_WORDS = (
     "跌倒", "摔倒", "救命", "晕倒", "意识不清", "大出血",
 )
 CRISIS_WORDS = ("不想活", "自杀", "活着没意思", "想死")
-
-
-def system_prompt() -> str:
-    return (
-        "你是“小乐”，一台面向老年人的居家陪伴机器人。"
-        "说话要温暖、简短、口语化，语速慢，先共情再回答。"
-        "不要假装自己是真人；不要做医学诊断，不要开药，不要夸大能力。"
-        "涉及胸痛、呼吸困难、跌倒、意识不清等紧急情况时，"
-        "立即建议坐下/躺下、呼叫家人或拨打120。"
-        "可以聊家常、提醒吃药、询问睡眠和心情、解释机器人能做什么。"
-        "每次回答尽量控制在80个汉字以内。"
-    )
 
 
 def load_models():
@@ -124,6 +113,18 @@ def robot_status() -> dict:
         return r.json()
     except Exception as e:
         return {"connected": False, "error": str(e)}
+
+
+def robot_move(forward_m: float = 0.0, turn_deg: float = 0.0) -> dict:
+    """Measured move: turn first, then drive, so '往前走三十厘米' is literal."""
+    try:
+        r = requests.post(f"{ROBOT_API}/move",
+                          json={"forward_m": forward_m, "turn_deg": turn_deg},
+                          timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": f"robot API: {type(e).__name__}: {e}"}
 
 
 def speech_file(text: str) -> str | None:
@@ -201,101 +202,150 @@ def fallback_chat(text: str) -> str:
     return random.choice(prompts)
 
 
-def llm_chat(text: str) -> tuple[str | None, str]:
-    base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
-    key = os.environ.get("LLM_API_KEY", "")
-    model = os.environ.get("LLM_MODEL", "")
-    if not base or not model:
-        return None, "fallback"
-    messages = [{"role": "system", "content": system_prompt()}]
-    messages.extend(CHAT_HISTORY[-MAX_HISTORY:])
-    messages.append({"role": "user", "content": text})
-    headers = {"Content-Type": "application/json"}
-    if key:
-        headers["Authorization"] = f"Bearer {key}"
-    try:
-        r = requests.post(
-            f"{base}/chat/completions",
-            headers=headers,
-            json={"model": model, "messages": messages, "temperature": 0.6, "max_tokens": 220},
-            timeout=20,
-        )
-        r.raise_for_status()
-        j = r.json()
-        reply = j["choices"][0]["message"]["content"].strip()
-        return reply[:300], "llm"
-    except Exception as e:
-        print("LLM failed, using fallback:", type(e).__name__, e, flush=True)
-        return None, "fallback"
-
-
-def chat_reply(text: str) -> tuple[str, str]:
-    if is_crisis(text) or is_emergency(text):
-        reply, engine = fallback_chat(text), "safety"
-    else:
-        reply, engine = llm_chat(text)
-        if reply is None:
-            reply, engine = fallback_chat(text), "fallback"
-    CHAT_HISTORY.append({"role": "user", "content": text})
-    CHAT_HISTORY.append({"role": "assistant", "content": reply})
-    del CHAT_HISTORY[:-MAX_HISTORY]
-    return reply, engine
+INTENT_REPLY = {
+    "stop": ("stop", "好的，已停止。"),
+    "come": ("come", "我过来了，请注意安全。"),
+    "report": ("report", "机器人在线，底盘已停止，双臂和双轮已连接。"),
+    "forward": ("forward", "好的，向前一点。"),
+    "backward": ("backward", "好的，向后退一点。"),
+    "turn_left": ("turn_left", "好的，向左转。"),
+    "turn_right": ("turn_right", "好的，向右转。"),
+    "look": ("look", "好的，我看着您。"),
+}
 
 
 def handle_intent(intent: str, text: str = "") -> dict:
-    if intent == "stop":
+    if intent not in INTENT_REPLY:
+        return {"text": text, "intent": intent, "reply": "未知意图"}
+    cmd, ok_reply = INTENT_REPLY[intent]
+    result = robot_command(cmd)
+    status = None
+    reply = ok_reply
+    if isinstance(result, dict) and result.get("error"):
+        reply = "我这边连不上机器人，请检查电源和串口。"
+    elif intent == "report":
+        status = robot_status()
+        if not status.get("connected"):
+            reply = "机器人未连接，请检查串口和电源。"
+    out = {"text": text, "intent": intent, "reply": reply, "robot": result,
+           "audio": speech_file(reply)}
+    if status is not None:
+        out["status"] = status
+    return out
+
+
+def _push_history(text: str, reply: str) -> None:
+    CHAT_HISTORY.append({"role": "user", "content": text})
+    CHAT_HISTORY.append({"role": "assistant", "content": reply})
+    del CHAT_HISTORY[:-MAX_HISTORY]
+
+
+def handle_action(decision: dict, text: str = "") -> dict:
+    """Execute a tool call from agent_brain and speak a short confirmation."""
+    action = decision.get("action", "")
+    args = decision.get("args") or {}
+    reply = (decision.get("reply") or "").strip()
+    extra = {}
+
+    if action == "stop_robot":
         result = robot_command("stop")
-        reply = "好的，已停止。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "come":
+    elif action == "move_robot":
+        try:
+            fwd = float(args.get("forward_m") or 0.0)
+            turn = float(args.get("turn_deg") or 0.0)
+        except (TypeError, ValueError):
+            fwd, turn = 0.0, 0.0
+        if abs(fwd) < 0.01 and abs(turn) < 1.0:
+            reply = reply or "您想让我往前走，还是转个方向？"
+            result = {"error": "no distance or angle"}
+        else:
+            result = robot_move(fwd, turn)
+            if reply in ("", "好的。", "好。"):
+                steps = []
+                if abs(fwd) >= 0.01:
+                    steps.append(f"{'前' if fwd > 0 else '后'}进{abs(fwd) * 100:.0f}厘米")
+                if abs(turn) >= 1.0:
+                    steps.append(f"{'左' if turn > 0 else '右'}转{abs(turn):.0f}度")
+                reply = "好的，" + "，再".join(steps) + "。"
+    elif action == "come_here":
         result = robot_command("come")
-        reply = "我过来了，请注意安全。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "report":
+    elif action == "look_at_me":
+        result = robot_command("look")
+    elif action == "report_status":
         result = robot_command("report")
         status = robot_status()
+        extra["status"] = status
         if status.get("connected"):
-            reply = "机器人在线，底盘已停止，双臂和双轮已连接。"
+            reply = reply or "我在线，底盘已经停稳。"
         else:
-            reply = "机器人未连接，请检查串口和电源。"
-        return {"text": text, "intent": intent, "reply": reply,
-                "robot": result, "status": status, "audio": speech_file(reply)}
-    if intent == "forward":
-        result = robot_command("forward")
-        reply = "好的，向前一点。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "backward":
-        result = robot_command("backward")
-        reply = "好的，向后退一点。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "turn_left":
-        result = robot_command("turn_left")
-        reply = "好的，向左转。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "turn_right":
-        result = robot_command("turn_right")
-        reply = "好的，向右转。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    if intent == "look":
-        result = robot_command("look")
-        reply = "好的，我看着您。"
-        return {"text": text, "intent": intent, "reply": reply, "robot": result,
-                "audio": speech_file(reply)}
-    return {"text": text, "intent": intent, "reply": "未知意图"}
+            reply = "机器人还没连上，请检查电源和串口。"
+    else:
+        result = {"error": f"unknown action {action}"}
+
+    if not reply:
+        reply = agent_brain.ACTION_REPLY.get(action, "好的。")
+    if isinstance(result, dict) and result.get("error") \
+            and result.get("error") != "no distance or angle":
+        # Never claim an action succeeded when the robot API did not take it.
+        reply = "我这边连不上机器人，请检查电源和串口。"
+    _push_history(text, reply)
+    return {"text": text, "intent": action, "reply": reply,
+            "engine": decision.get("engine", "llm-tool"), "robot": result,
+            "audio": speech_file(reply), "mode": "command", **extra}
 
 
 def route_text(text: str) -> dict:
-    intent = map_intent(text)
-    if intent != "unknown":
-        return {**handle_intent(intent, text), "mode": "command"}
-    reply, engine = chat_reply(text)
-    return {"text": text, "intent": "chat", "reply": reply, "engine": engine,
+    text = (text or "").strip()
+    if not text:
+        return {"text": text, "intent": "empty", "reply": "",
+                "engine": "none", "mode": "empty"}
+
+    # Safety replies never go through the model: they must be exact.
+    if is_crisis(text) or is_emergency(text):
+        reply = fallback_chat(text)
+        _push_history(text, reply)
+        return {"text": text, "intent": "safety", "reply": reply,
+                "engine": "safety", "audio": speech_file(reply),
+                "mode": "chat"}
+
+    # "停下" must stop the base even if the model would rather chat about it.
+    if map_intent(text) == "stop":
+        return {**handle_intent("stop", text), "mode": "command",
+                "engine": "keyword"}
+
+    # One function-calling turn decides chat vs. robot action.
+    decision = agent_brain.decide(text, CHAT_HISTORY)
+    if decision is None:
+        # LLM unreachable: keyword table, then the rule-based companion.
+        intent = map_intent(text)
+        if intent != "unknown":
+            return {**handle_intent(intent, text), "mode": "command"}
+        reply = fallback_chat(text)
+        _push_history(text, reply)
+        return {"text": text, "intent": "chat", "reply": reply,
+                "engine": "fallback", "audio": speech_file(reply),
+                "mode": "chat"}
+
+    action = decision["action"]
+    if action in ("move_robot", "come_here", "look_at_me") \
+            and not agent_brain.has_motion_words(text):
+        # The model sometimes latches onto an earlier robot turn and calls a
+        # movement tool while the user is just talking.  Re-ask without tools.
+        retry = agent_brain.chat_only(text, CHAT_HISTORY)
+        if retry and retry.get("reply"):
+            decision = retry
+            action = "chat"
+
+    if action != "chat":
+        agent_brain.remember_async(text)
+        return handle_action(decision, text)
+
+    reply = (decision.get("reply") or "").strip() or fallback_chat(text)
+    reply = reply[:300]
+    _push_history(text, reply)
+    agent_brain.remember_async(text)
+    return {"text": text, "intent": "chat", "reply": reply,
+            "engine": decision.get("engine", "llm"),
             "audio": speech_file(reply), "mode": "chat"}
 
 
