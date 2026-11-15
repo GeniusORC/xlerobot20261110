@@ -45,9 +45,14 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+SOFTWARE = os.path.join(ROOT, "XLeRobot", "software")
 EXAMPLE = os.path.join(
-    ROOT, "XLeRobot", "software", "examples",
-    "7_xlerobot_2wheels_teleop_joycon.py")
+    SOFTWARE, "examples", "7_xlerobot_2wheels_teleop_joycon.py")
+
+# The example imports ``joyconrobotics`` and the vendored plugins by plain
+# module name, exactly as the official docs describe.
+if SOFTWARE not in sys.path:
+    sys.path.insert(0, SOFTWARE)
 
 # Measured on this build (see docs/setup.md).
 WHEEL_RADIUS = 0.0635
@@ -99,6 +104,12 @@ def main():
                     help="skip the rerun viewer (default)")
     ap.add_argument("--check-only", action="store_true",
                     help="only verify Joy-Con visibility, do not move")
+    ap.add_argument("--preflight", action="store_true",
+                    help="read both Joy-Cons (sticks, buttons, gyro) without "
+                         "connecting to the robot or moving anything")
+    ap.add_argument("--fps", type=float, default=30.0,
+                    help="control loop rate; the upstream loop has no sleep, "
+                         "so it runs at ~50 Hz and overloads the motor bus")
     args, rest = ap.parse_known_args()
 
     if not check_hidraw():
@@ -108,6 +119,32 @@ def main():
         return 0
 
     mod = load_example()
+
+    if args.preflight:
+        import time
+        print("opening both Joy-Cons through joyconrobotics (no robot) ...")
+        jr = mod.FixedAxesJoyconRobotics("right", dof_speed=[2, 2, 2, 1, 1, 1])
+        jl = mod.FixedAxesJoyconRobotics("left", dof_speed=[2, 2, 2, 1, 1, 1])
+        try:
+            for _ in range(5):
+                pr, gr, br = jr.get_control()
+                pl, gl, bl = jl.get_control()
+                print(f"R pose={[round(float(v), 3) for v in pr]} "
+                      f"grip={gr:.2f} btn={br}")
+                print(f"L pose={[round(float(v), 3) for v in pl]} "
+                      f"grip={gl:.2f} btn={bl}")
+                time.sleep(0.2)
+            print("buttons  A/B/X/Y  R:",
+                  jr.joycon.get_button_a(), jr.joycon.get_button_b(),
+                  jr.joycon.get_button_x(), jr.joycon.get_button_y(),
+                  " L:",
+                  jl.joycon.get_button_up(), jl.joycon.get_button_down(),
+                  jl.joycon.get_button_left(), jl.joycon.get_button_right())
+        finally:
+            jr.disconnect()
+            jl.disconnect()
+        print("preflight ok")
+        return 0
 
     # Inject this robot's geometry and skip the cameras (camera_web owns them).
     base_cfg = mod.XLerobot2WheelsConfig
@@ -120,7 +157,28 @@ def main():
 
     mod.XLerobot2WheelsConfig = config
     mod.init_rerun = lambda *a, **k: None
-    mod.log_rerun_data = lambda *a, **k: None
+
+    # The upstream loop never calls precise_sleep, so it spins at ~50 Hz and
+    # every iteration does three full bus reads (left arm, right arm, head).
+    # On this robot that overruns the CH343 link: after ~3 minutes the bus
+    # stops answering (ConnectionError: no status packet).  log_rerun_data()
+    # is the last call in the loop, so pacing it there restores the --fps the
+    # example advertises without editing the upstream file.
+    from lerobot.utils.robot_utils import precise_sleep
+    frame = 1.0 / max(args.fps, 1.0)
+
+    def paced_log(*a, **k):
+        precise_sleep(frame)
+
+    mod.log_rerun_data = paced_log
+
+    # ``robot.connect()`` asks "Press ENTER to restore calibration from file,
+    # or type 'c' ...".  Answering ENTER is the documented default and is what
+    # robot_api.py does too; without this the script dies with EOFError when it
+    # is not attached to a terminal.
+    import builtins
+    original_input = builtins.input
+    builtins.input = lambda *a, **k: ""
 
     # Default the ports to this robot's udev symlinks unless the caller
     # overrides them.
@@ -136,7 +194,15 @@ def main():
     print("running:", EXAMPLE)
     print("ports:", PORT1, PORT2, "| id:", ROBOT_ID,
           f"| wheel_radius={WHEEL_RADIUS} wheelbase={WHEELBASE}")
-    mod.main()
+    try:
+        mod.main()
+    except ConnectionError as e:
+        print(f"\nmotor bus stopped answering: {e}", file=sys.stderr)
+        print("Power-cycle the 12 V rail / reseat the USB cables, then "
+              "rerun.  A lower --fps (e.g. 20) also helps.", file=sys.stderr)
+        return 2
+    finally:
+        builtins.input = original_input
     return 0
 
 
