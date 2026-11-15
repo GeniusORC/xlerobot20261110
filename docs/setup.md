@@ -1312,3 +1312,54 @@ Verified on 2026-11-15 after power-on: bus_a `[1,2,3,4,5,6,9,10]`,
 bus_b `[1..8]`. A `/move` of 8 cm forward/back and a 15 deg left turn both
 reported "已停稳", and the voice path "往前走十厘米" drove the base through
 `move_robot{"forward_m":0.1}`.
+
+## 28. The whole companion demo on one command
+
+```bash
+./scripts/start_demo.sh     # start everything
+./scripts/stop_demo.sh      # stop everything
+```
+
+| Service | Port | What you get |
+|---|---|---|
+| `camera_web.py` | 8080 | web page with four live streams: head, left, right, head depth |
+| `voice_auto_web.py` | 8082 | always-on voice, chat, face lip-sync |
+| `health_station_web.py` | 8084 | gait capture and reports |
+| `robot_api.py` | 8090 | base / head / arms |
+| `face_display.py` | 8086 | the laptop screen as a face, full screen |
+| `head_track.py` | — | turns the head to keep your face centred |
+
+Open `http://127.0.0.1:8080/` in a browser to watch the video.  Use the second
+monitor (DP-1) for the browser, because `face_display.py` owns the laptop
+panel in full screen.
+
+### Head tracking
+
+`head_track.py` closes the loop on **pixels**, not motor angles:
+
+1. `vision_context.state_fast()` gives the face box (~50 ms, no HOG, 0.2 s cache).
+2. The box centre offset becomes `dpan` / `dtilt` (deadband 6% of the image,
+   steps clipped to 9 / 6, at most one command every 0.18 s so a stale frame
+   cannot overshoot).
+3. robot_api `/head` moves the servos; the next frame measures the result.
+
+No calibration is needed and the direction signs are self-correcting: if the
+pixel error grows three steps in a row, `PAN_SIGN` / `TILT_SIGN` flip.
+
+Extras:
+
+* a smile in the camera is mirrored as a `happy` face for 4 s;
+* after 5 s without a face it sweeps ±7 units at a time to look for you.
+
+```bash
+.venv/bin/python scripts/head_track.py --verbose   # print face position + pan/tilt
+.venv/bin/python scripts/head_track.py --no-face   # head only, do not touch the face
+```
+
+Measured on 2026-11-15: starting at pan +9 with the face at x=78 (far left),
+the loop walked the face to x=290 (centre) in about 3 s and then held it with
+`offset=-0.04`, i.e. inside the deadband.
+
+Base following is deliberately **not** part of `head_track.py`: driving while
+someone is talking to the robot needs the health station's distance safety
+(0.85 m minimum, hard stop 0.60 m), so it stays in that code path.

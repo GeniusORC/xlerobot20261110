@@ -31,6 +31,7 @@ FACE_W_M = (0.10, 0.30)   # plausible width of a human face
 
 _LOCK = threading.Lock()
 _CACHE = {"at": 0.0, "value": None}
+_FAST = {"at": 0.0, "value": None}
 _CASCADE = None
 _PROFILE = None
 _SMILE = None
@@ -85,7 +86,7 @@ def _best_face(gray, cascade, fx):
     return out
 
 
-def analyse_once():
+def analyse_once(hog=True):
     got = grab()
     if got is None:
         return None
@@ -134,7 +135,11 @@ def analyse_once():
         return res
 
     # No usable face: ask HOG whether a person is in frame at all.  Kept small
-    # (256 px) because this runs on the same CPU as the ASR.
+    # (256 px) because this runs on the same CPU as the ASR.  Head tracking
+    # passes hog=False: it only needs the face box, and 8 Hz matters more.
+    if not hog:
+        return {"present": False, "person_no_face": False,
+                "width": w, "height": h}
     small = cv2.resize(gray, (256, int(256 * h / w)))
     try:
         rects, weights = _hog().detectMultiScale(
@@ -201,3 +206,14 @@ if __name__ == "__main__":
     print(json.dumps(s, ensure_ascii=False))
     print(describe(force=False))
     print(f"{(time.time() - t) * 1000:.0f} ms")
+
+
+def state_fast():
+    """Face box only, no HOG, cached 0.2 s: for the head tracker (~8 Hz)."""
+    now = time.time()
+    with _LOCK:
+        if _FAST["value"] is not None and now - _FAST["at"] < 0.2:
+            return _FAST["value"]
+        value = analyse_once(hog=False)
+        _FAST.update(at=now, value=value)
+    return value
