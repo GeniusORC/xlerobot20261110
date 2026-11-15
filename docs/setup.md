@@ -1090,3 +1090,46 @@ unavailable while it runs. Restart `robot_api.py` afterwards:
 nohup .venv-robot/bin/python scripts/robot_api.py --port 8090 \
   > /tmp/opencode/robot_api.log 2>&1 & echo $! > /tmp/opencode/robot_api.pid
 ```
+
+## 24. Laptop screen as the robot's face
+
+The laptop is bolted to the cart and faces the user, so it doubles as the
+robot's face — no extra screen and no HDMI cable.
+
+```bash
+DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
+  .venv/bin/python scripts/face_display.py --monitor 1
+```
+
+`--monitor N` picks the Nth `xrandr` output (1 = the laptop panel, 2 = the
+external monitor). `--windowed` is for testing, `--debug` prints the emotion
+name on screen, `--list-monitors` prints the layout.
+
+The face is a plain Tk canvas: two eyes with pupils and highlights, brows, a
+parametric mouth, breathing, random blinks, and lip-sync to the TTS wav
+(RMS envelope at 50 Hz). It costs almost no CPU and runs at 30 fps.
+
+Emotions: `neutral happy surprised sad concerned listening thinking sleepy`.
+Each has eye openness, brow offset, mouth curve, mouth openness and pupil
+scale, blended by `intensity`.
+
+HTTP control (default port 8086):
+
+| Endpoint | Body | Effect |
+|---|---|---|
+| `GET /state` | — | current emotion, mouth level, look |
+| `POST /emotion` | `{"emotion":"happy","intensity":0.8,"hold":3}` | show an emotion, then fall back |
+| `POST /say` | `{"audio":"reply_xxx.wav","emotion":"happy"}` | lip-sync that wav |
+| `POST /say` | `{"duration":2.5}` | open the mouth for N seconds |
+| `POST /look` | `{"dx":0.2,"dy":-0.1}` | move the pupils |
+| `POST /blink` | — | blink once |
+
+`scripts/face_client.py` is a best-effort client: if the face is not running
+every call is a no-op and the robot still talks.
+
+Wiring that is already in place:
+
+- `voice_web.speech_file()` calls `face.say(wav, emotion=emotion_for(reply))`,
+  so every spoken reply is lip-synced and leaves a matching expression.
+- `voice_auto_web.py` sets `listening` when VAD detects speech and `thinking`
+  while the ASR/LLM turn runs.

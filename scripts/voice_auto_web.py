@@ -28,6 +28,7 @@ import soundfile as sf
 import torch
 from flask import Flask, jsonify, request
 
+import face_client as face
 import voice_web as vw
 
 CAPTURE_DEV = os.environ.get("CAPTURE_DEV", "default")
@@ -51,6 +52,10 @@ ARECORD = None
 LAST_SPOKEN = ""
 LAST_SPOKEN_AT = 0.0
 RECENT_SPOKEN = []  # (text, timestamp)
+
+# Anything that looks like a robot command must never be filtered as echo.
+COMMAND_WORDS = ("停", "前进", "后退", "左转", "右转", "过来", "报告",
+                 "看我", "靠近", "走", "别动", "开始", "结束")
 
 
 def init_chat_db():
@@ -107,7 +112,7 @@ def play_audio(name):
         print("aplay failed:", e, flush=True)
     finally:
         # Keep the mic muted for the room tail / echo after playback.
-        time.sleep(2.0)
+        time.sleep(0.4)
         LISTEN_PAUSED.clear()
 
 
@@ -125,25 +130,31 @@ def _remember_spoken(text):
 
 
 def is_echo(text):
-    """Ignore the robot's own TTS being picked up by the microphone."""
+    """Ignore the robot's own TTS being picked up by the microphone.
+
+    The old version used a 15 s window and a 0.70 similarity ratio, so a real
+    answer that echoed the robot's wording was silently dropped ("已停止" ->
+    user says "停止").  Now: 4 s window, 0.88 ratio, similar length, and a
+    command is never treated as echo.
+    """
     a = _norm(text)
+    if any(k in a for k in COMMAND_WORDS):
+        return False
     if len(a) < 3:
         # Punctuation, breath noise, single syllables.
         return True
     now = time.time()
     for spoken, ts in reversed(RECENT_SPOKEN):
-        if now - ts > 15.0:
+        if now - ts > 4.0:
             continue
         b = _norm(spoken)
         if not b:
             continue
-        if a in b or b in a:
+        if len(a) >= 4 and a in b:
             return True
-        sm = difflib.SequenceMatcher(None, a, b)
-        match = sm.find_longest_match(0, len(a), 0, len(b))
-        if match.size >= max(3, int(0.6 * len(a))):
-            return True
-        if sm.ratio() > 0.70:
+        if abs(len(a) - len(b)) > max(2, int(0.4 * len(b))):
+            continue
+        if difflib.SequenceMatcher(None, a, b).ratio() > 0.88:
             return True
     return False
 
@@ -214,6 +225,7 @@ def listen_loop():
                 speech = list(pre)
                 silence = 0
                 print("speech start", flush=True)
+                face.emotion("listening", hold=8)
         else:
             speech.append(x)
             if prob < 0.35:
@@ -239,6 +251,7 @@ def listen_loop():
                         elif is_echo(text):
                             add_message("sys", "已忽略机器人自己的语音")
                         else:
+                            face.emotion("thinking", hold=12)
                             process_text(text)
                     except Exception as e:
                         print("ASR failed:", type(e).__name__, e, flush=True)

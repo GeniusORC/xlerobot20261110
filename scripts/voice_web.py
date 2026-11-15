@@ -28,6 +28,7 @@ from datetime import datetime
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
+import face_client as face
 from voice_loop import tts, transcribe, vad_trim
 
 ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090")
@@ -131,10 +132,26 @@ def speech_file(text: str) -> str | None:
     wav = os.path.join(AUDIO_DIR, name)
     try:
         tts(text, mp3, wav)
+        # The laptop screen is the robot's face: lip-sync the wav and leave a
+        # matching expression on screen for a few seconds afterwards.
+        face.say(name, emotion=emotion_for(text))
         return name
     except Exception as e:
         print("TTS failed:", type(e).__name__, e, flush=True)
         return None
+
+
+def emotion_for(text: str) -> str:
+    t = text or ""
+    if is_emergency(t) or is_crisis(t):
+        return "concerned"
+    if any(k in t for k in ("太好了", "真好", "开心", "高兴", "恭喜", "棒")):
+        return "happy"
+    if any(k in t for k in ("疼", "痛", "难受", "孤单", "寂寞", "不舒服", "担心")):
+        return "concerned"
+    if any(k in t for k in ("不知道", "让我想想", "我查一下")):
+        return "thinking"
+    return "neutral"
 
 
 def fallback_chat(text: str) -> str:
