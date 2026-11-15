@@ -19,6 +19,11 @@ Default mapping (change with the flags below):
   B / circle             -> emergency stop
   Start / options        -> quit
 
+Every joystick node is opened, so a Joy-Con pair works as two devices: the
+left stick drives and the right stick turns.  A single Joy-Con uses its one
+stick (``--single-stick``).  Axis/button numbers of the second device are
+offset by 100 to keep them apart.
+
 The base is driven through ``robot_api``'s short-lease ``/velocity`` endpoint
 at 20 Hz.  The lease expires after 0.6 s, so releasing the stick, unplugging the
 controller or killing this script stops the robot by itself.
@@ -27,6 +32,7 @@ Examples
 --------
     source scripts/env.sh robot
     python scripts/teleop_joy.py --list          # what is connected?
+    python scripts/teleop_joy.py --connect       # wake paired Joy-Cons, then drive
     python scripts/teleop_joy.py --probe         # print raw axis/button ids
     python scripts/teleop_joy.py                 # drive
     python scripts/teleop_joy.py --single-stick  # one Joy-Con (stick = axis 0/1)
@@ -93,8 +99,12 @@ def js_name(path):
         return "?"
 
 
-def read_js(path, state, quit_btn, estop_btn, stop_btn, verbose=False):
-    """Read 8-byte ``js_event`` structs until the file closes."""
+def read_js(path, state, offset, quit_btn, estop_btn, stop_btn, verbose=False):
+    """Read 8-byte ``js_event`` structs until the file closes.
+
+    ``offset`` namespaces this device's axes/buttons (0, 100, 200, ...) so a
+    left and a right Joy-Con can be used together without clashing on axis 0.
+    """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except Exception as e:
@@ -118,21 +128,23 @@ def read_js(path, state, quit_btn, estop_btn, stop_btn, verbose=False):
                 buf = buf[8:]
                 etype &= ~JS_EVENT_INIT
                 if etype == JS_EVENT_AXIS:
-                    state.set_axis(number, value / AXIS_MAX)
+                    state.set_axis(offset + number, value / AXIS_MAX)
                     if verbose:
-                        print(f"AXIS  {number:2d}  {value:+6d}", flush=True)
+                        print(f"AXIS  {offset + number:3d}  {value:+6d}", flush=True)
                 elif etype == JS_EVENT_BUTTON:
                     pressed = value != 0
-                    state.set_button(number, pressed)
+                    state.set_button(offset + number, pressed)
                     if verbose:
-                        print(f"BTN   {number:2d}  {'down' if pressed else 'up'}",
-                              flush=True)
+                        print(f"BTN   {offset + number:3d}  "
+                              f"{'down' if pressed else 'up'}", flush=True)
                     if pressed:
-                        if quit_btn is not None and number == quit_btn:
+                        if quit_btn is not None and offset + number == quit_btn:
                             state.quit = True
-                        elif estop_btn is not None and number == estop_btn:
+                        elif (estop_btn is not None
+                              and offset + number == estop_btn):
                             state.estop = True
-                        elif stop_btn is not None and number == stop_btn:
+                        elif (stop_btn is not None
+                              and offset + number == stop_btn):
                             with state.lock:
                                 state.axes.clear()
     finally:
@@ -166,7 +178,8 @@ def evdev_devices():
     return out
 
 
-def read_evdev(path, state, quit_btn, estop_btn, stop_btn, verbose=False):
+def read_evdev(path, state, offset, quit_btn, estop_btn, stop_btn,
+               verbose=False):
     import evdev
     from evdev import ecodes
     try:
@@ -190,7 +203,7 @@ def read_evdev(path, state, quit_btn, estop_btn, stop_btn, verbose=False):
             if state.quit:
                 break
             if ev.type == ecodes.EV_ABS:
-                n = axis_names.get(ev.code, ev.code)
+                n = offset + axis_names.get(ev.code, ev.code)
                 lo, hi = 0, 255
                 try:
                     info = dev.absinfo(ev.code)
@@ -204,7 +217,7 @@ def read_evdev(path, state, quit_btn, estop_btn, stop_btn, verbose=False):
                     print(f"ABS   {ecodes.ABS.get(ev.code, ev.code)} -> {n} "
                           f"{value:+.2f}", flush=True)
             elif ev.type == ecodes.EV_KEY:
-                n = btn_names.get(ev.code, ev.code)
+                n = offset + btn_names.get(ev.code, ev.code)
                 pressed = ev.value != 0
                 state.set_button(n, pressed)
                 if verbose:
@@ -268,20 +281,71 @@ def follow_is_on():
         return False
 
 
+def connect_bluetooth(match="joy-con", wait=6.0):
+    """Connect already-paired Bluetooth controllers.
+
+    A sleeping Joy-Con cannot be woken over Bluetooth; press any button on
+    the controller first.  This only saves the manual ``bluetoothctl connect``.
+    """
+    import re
+    import subprocess
+
+    try:
+        out = subprocess.run(["bluetoothctl", "devices"], capture_output=True,
+                             text=True, timeout=8).stdout
+    except Exception as e:
+        print(f"--connect: bluetoothctl unavailable ({type(e).__name__})",
+              flush=True)
+        return False
+    found = []
+    for line in out.splitlines():
+        m = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+        if m and match in m.group(2).lower():
+            found.append((m.group(1), m.group(2)))
+    if not found:
+        print(f"--connect: no paired device matching {match!r}", flush=True)
+        return False
+
+    ok = False
+    for mac, name in found:
+        try:
+            r = subprocess.run(["bluetoothctl", "connect", mac],
+                               capture_output=True, text=True, timeout=25)
+            text = (r.stdout + r.stderr).strip().splitlines()
+            tail = text[-1] if text else ""
+            print(f"--connect: {name} ({mac}) -> {tail}", flush=True)
+            ok = ok or r.returncode == 0
+        except Exception as e:
+            print(f"--connect: {name} failed ({type(e).__name__})", flush=True)
+
+    # udev needs a moment to create the js/event nodes.
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if any("joy-con" in js_name(p).lower() for p in js_devices()):
+            break
+        time.sleep(0.25)
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="list input devices")
     ap.add_argument("--probe", action="store_true",
                     help="print raw axis/button events for 30 s")
-    ap.add_argument("--device", help="explicit /dev/input/jsX or eventX path")
+    ap.add_argument("--device", nargs="+",
+                    help="one or more /dev/input/jsX or eventX paths")
     ap.add_argument("--backend", choices=("auto", "js", "evdev"), default="auto")
     ap.add_argument("--single-stick", action="store_true",
                     help="one stick: Y drives, X turns")
-    ap.add_argument("--axis-x", type=int, default=1)
-    ap.add_argument("--axis-theta", type=int, default=3)
+    ap.add_argument("--axis-x", type=int, default=None,
+                    help="axis for forward/back (default 1; device[1] uses 101)")
+    ap.add_argument("--axis-theta", type=int, default=None,
+                    help="axis for turning (default 3, or 100 for a 2nd device)")
     ap.add_argument("--invert-x", action="store_true")
     ap.add_argument("--invert-theta", action="store_true")
+    ap.add_argument("--no-auto-invert", action="store_true",
+                    help="keep raw Joy-Con stick polarity")
     ap.add_argument("--deadzone", type=float, default=0.12)
     ap.add_argument("--max-x", type=float, default=0.22,
                     help="m/s (robot_api clamps to -0.22..0.30)")
@@ -291,13 +355,18 @@ def main():
     ap.add_argument("--estop-btn", type=int, default=1)
     ap.add_argument("--quit-btn", type=int, default=8)
     ap.add_argument("--rate", type=float, default=20.0, help="Hz")
+    ap.add_argument("--connect", action="store_true",
+                    help="connect already-paired Bluetooth Joy-Cons first")
     ap.add_argument("--takeover", action="store_true",
                     help="turn off the health station's follow mode first")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    if args.single_stick:
+    if args.single_stick and args.axis_theta is None:
         args.axis_theta = 0
+
+    if args.connect:
+        connect_bluetooth()
 
     if args.list:
         print("legacy joystick nodes:")
@@ -314,25 +383,65 @@ def main():
             print("  (none visible; you may need the 'input' group)")
         return
 
-    # pick a device
-    path = args.device
-    backend = args.backend
-    if path is None:
-        if backend in ("auto", "js") and js_devices():
-            path = js_devices()[0]
-            backend = "js"
-        else:
-            devs = evdev_devices()
-            if devs:
-                path, backend = devs[0][0], "evdev"
-            else:
-                print("No joystick found. Plug it in / pair it, then run "
-                      "`--list`.", flush=True)
-                return
-    elif backend == "auto":
-        backend = "js" if path.startswith("/dev/input/js") else "evdev"
+    # pick devices
+    def _not_a_keyboard(name):
+        low = name.lower()
+        return not any(k in low for k in (
+            "keyboard", "mouse", "touchpad", "lid switch", "video bus",
+            "hda ", "hdmi", "button"))
 
-    print(f"device: {path} ({backend})", flush=True)
+    devices = []
+    if args.device:
+        for p in args.device:
+            b = args.backend
+            if b == "auto":
+                b = "js" if p.startswith("/dev/input/js") else "evdev"
+            devices.append((p, b))
+    else:
+        js = [p for p in js_devices() if _not_a_keyboard(js_name(p))]
+        if js and args.backend in ("auto", "js"):
+            devices = [(p, "js") for p in js]
+        else:
+            devs = [(p, n) for p, n, _a, _k in evdev_devices()
+                    if _not_a_keyboard(n)]
+            if devs and args.backend in ("auto", "evdev"):
+                devices = [(p, "evdev") for p, _n in devs]
+    if not devices:
+        print("No joystick found. Plug it in / pair it, then run `--list`.",
+              flush=True)
+        return
+
+    for i, (p, b) in enumerate(devices):
+        label = js_name(p) if b == "js" else ""
+        print(f"device[{i}]: {p} ({b}) {label!r}", flush=True)
+
+    names = " ".join(js_name(p) if b == "js" else "" for p, b in devices).lower()
+
+    if args.axis_x is None:
+        args.axis_x = 1
+    if args.axis_theta is None:
+        if len(devices) >= 2:
+            # The second device's own stick: js always reports axes 0/1,
+            # evdev reports the right stick as ABS_RX/ABS_RY (2/3).
+            args.axis_theta = 100 + (0 if devices[1][1] == "js" else 2)
+        elif "joy-con" in names:
+            args.axis_theta = 0        # one Joy-Con: single stick
+        else:
+            args.axis_theta = 3
+
+    # Linux reports a stick pushed up / left as negative.  A Joy-Con follows
+    # that convention, so raw Y and X must be negated to get "up = forward"
+    # and "left = turn left".  Other pads usually need the same; pass
+    # --no-auto-invert if a pad already reports the opposite.
+    if "joy-con" in names and not args.no_auto_invert:
+        args.invert_x = True
+        args.invert_theta = True
+        print("Joy-Con detected: inverting sticks (up=forward, left=left)",
+              flush=True)
+
+    print(f"mapping: axis x={args.axis_x} theta={args.axis_theta} "
+          f"deadzone={args.deadzone} invert=({args.invert_x},"
+          f"{args.invert_theta})", flush=True)
     if args.takeover:
         try:
             requests.post(f"{HEALTH_API}/api/follow", json={"on": False},
@@ -345,12 +454,15 @@ def main():
               "or it will fight the joystick.", flush=True)
 
     state = JoyState()
-    reader = threading.Thread(
-        target=(read_js if backend == "js" else read_evdev),
-        args=(path, state, args.quit_btn, args.estop_btn, args.stop_btn,
-              args.probe),
-        daemon=True)
-    reader.start()
+    readers = []
+    for i, (p, b) in enumerate(devices):
+        t = threading.Thread(
+            target=(read_js if b == "js" else read_evdev),
+            args=(p, state, i * 100, args.quit_btn, args.estop_btn,
+                  args.stop_btn, args.probe),
+            daemon=True)
+        t.start()
+        readers.append(t)
 
     if args.probe:
         print("Probing for 30 s - move sticks and press buttons.", flush=True)
@@ -368,6 +480,10 @@ def main():
         center = dict(state.axes)
     print("axis centres:", {k: round(v, 2) for k, v in sorted(center.items())},
           flush=True)
+    for label, num in (("x", args.axis_x), ("theta", args.axis_theta)):
+        if num not in center:
+            print(f"WARNING: axis {num} ({label}) not reported; available axes "
+                  f"are {sorted(center)}. Pass --axis-{label} N.", flush=True)
 
     def axis_value(number):
         raw = ax.get(number, center.get(number, 0.0))
@@ -378,7 +494,7 @@ def main():
     sent = False
     try:
         while not state.quit:
-            if not reader.is_alive():
+            if not all(t.is_alive() for t in readers):
                 print("controller lost - stopping", flush=True)
                 break
             if state.estop:
