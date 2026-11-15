@@ -333,6 +333,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="list input devices")
     ap.add_argument("--probe", action="store_true",
                     help="print raw axis/button events for 30 s")
+    ap.add_argument("--probe-seconds", type=float, default=30.0)
     ap.add_argument("--device", nargs="+",
                     help="one or more /dev/input/jsX or eventX paths")
     ap.add_argument("--backend", choices=("auto", "js", "evdev"), default="auto")
@@ -398,22 +399,21 @@ def main():
                 b = "js" if p.startswith("/dev/input/js") else "evdev"
             devices.append((p, b))
     else:
-        js = [p for p in js_devices() if _not_a_keyboard(js_name(p))]
+        # Sort by name so a Joy-Con pair is always (L) then (R) regardless of
+        # which js* number the kernel handed out.
+        js = sorted((p for p in js_devices() if _not_a_keyboard(js_name(p))),
+                    key=lambda p: js_name(p).lower())
         if js and args.backend in ("auto", "js"):
             devices = [(p, "js") for p in js]
         else:
-            devs = [(p, n) for p, n, _a, _k in evdev_devices()
-                    if _not_a_keyboard(n)]
+            devs = sorted(((p, n) for p, n, _a, _k in evdev_devices()
+                           if _not_a_keyboard(n)), key=lambda pn: pn[1].lower())
             if devs and args.backend in ("auto", "evdev"):
                 devices = [(p, "evdev") for p, _n in devs]
     if not devices:
         print("No joystick found. Plug it in / pair it, then run `--list`.",
               flush=True)
         return
-
-    for i, (p, b) in enumerate(devices):
-        label = js_name(p) if b == "js" else ""
-        print(f"device[{i}]: {p} ({b}) {label!r}", flush=True)
 
     names = " ".join(js_name(p) if b == "js" else "" for p, b in devices).lower()
 
@@ -428,6 +428,16 @@ def main():
             args.axis_theta = 0        # one Joy-Con: single stick
         else:
             args.axis_theta = 3
+
+    for i, (p, b) in enumerate(devices):
+        label = js_name(p) if b == "js" else ""
+        if i == 0:
+            role = "drives + turns" if args.axis_theta < 100 else "drives"
+        elif i == 1:
+            role = "turns"
+        else:
+            role = "unused"
+        print(f"device[{i}]: {p} ({b}) {label!r} -> {role}", flush=True)
 
     # Linux reports a stick pushed up / left as negative.  A Joy-Con follows
     # that convention, so raw Y and X must be negated to get "up = forward"
@@ -465,8 +475,9 @@ def main():
         readers.append(t)
 
     if args.probe:
-        print("Probing for 30 s - move sticks and press buttons.", flush=True)
-        time.sleep(30)
+        print(f"Probing for {args.probe_seconds:.0f} s - move sticks and press "
+              f"buttons.", flush=True)
+        time.sleep(max(1.0, args.probe_seconds))
         state.quit = True
         print("probe done", flush=True)
         return
