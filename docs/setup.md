@@ -1269,3 +1269,46 @@ answer "你看我气色怎么样" with what the camera actually sees instead of
 ```bash
 .venv/bin/python scripts/vision_context.py     # dump state + sentence + latency
 ```
+
+## 27. Motor IDs on this robot (for scanning)
+
+Worth writing down because a scan of "1-8" looks like missing motors when it
+is only the wrong range:
+
+| Bus | Port | IDs |
+|---|---|---|
+| bus1 | `/dev/xlerobot_serial_b` (USB serial `5B8E114819`) | 1–6 left arm, 7–8 head pan/tilt |
+| bus2 | `/dev/xlerobot_serial_a` (USB serial `5B14030560`) | 1–6 right arm, **9–10 wheels** |
+
+The wheels are 9 and 10 (`config_xlerobot_2wheels.py`), not 7 and 8, so scan
+1–10 on bus2:
+
+```bash
+timeout 90 .venv-robot/bin/python - <<'PY'
+from lerobot.motors.feetech import FeetechMotorsBus
+from lerobot.motors import Motor, MotorNormMode
+motors = {i: Motor(i, "sts3215", MotorNormMode.DEGREES) for i in range(1, 11)}
+for port in ("/dev/xlerobot_serial_a", "/dev/xlerobot_serial_b"):
+    bus = FeetechMotorsBus(port=port, motors=motors)
+    found = {}
+    try:
+        bus.connect(handshake=False)
+        for i in range(1, 11):
+            try:
+                if bus.ping(i):
+                    found[i] = True
+            except Exception:
+                pass
+    finally:
+        try:
+            bus.disconnect()
+        except Exception:
+            pass
+    print(port, sorted(found))
+PY
+```
+
+Verified on 2026-11-15 after power-on: bus_a `[1,2,3,4,5,6,9,10]`,
+bus_b `[1..8]`. A `/move` of 8 cm forward/back and a 15 deg left turn both
+reported "已停稳", and the voice path "往前走十厘米" drove the base through
+`move_robot{"forward_m":0.1}`.
