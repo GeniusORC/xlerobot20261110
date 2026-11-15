@@ -214,8 +214,15 @@ def _post(messages, tools=None, temperature=0.5, max_tokens=300,
     return r.json()
 
 
-def build_messages(text: str, history=None) -> list:
+def build_messages(text: str, history=None, context=None) -> list:
     msgs = [{"role": "system", "content": system_prompt()}]
+    if context:
+        msgs.append({
+            "role": "system",
+            "content": f"当前视觉输入（机器人头部相机，自动检测）：{context}。"
+                       "回答与面前的人、距离、是否看得见相关的问题时以此为准；"
+                       "看不到就说看不到，不要编。",
+        })
     for m in (history or [])[-MAX_HISTORY:]:
         role = m.get("role")
         if role in ("user", "assistant") and m.get("content"):
@@ -234,10 +241,10 @@ def has_motion_words(text: str) -> bool:
     return any(k in (text or "") for k in MOTION_WORDS)
 
 
-def chat_only(text: str, history=None):
+def chat_only(text: str, history=None, context=None):
     """Plain completion without tools, used when a tool call misfires."""
     try:
-        j = _post(build_messages(text, history))
+        j = _post(build_messages(text, history, context))
         msg = j["choices"][0]["message"]
         return {"action": "chat", "args": {},
                 "reply": (msg.get("content") or "").strip(),
@@ -247,7 +254,7 @@ def chat_only(text: str, history=None):
         return None
 
 
-def decide(text: str, history=None):
+def decide(text: str, history=None, context=None):
     """One round trip: returns {action, args, reply, engine} or None.
 
     ``action`` is either ``"chat"`` or one of the TOOLS names.  Returning
@@ -255,7 +262,7 @@ def decide(text: str, history=None):
     keyword table.
     """
     try:
-        j = _post(build_messages(text, history), tools=TOOLS)
+        j = _post(build_messages(text, history, context), tools=TOOLS)
     except Exception as e:
         print("agent_brain: LLM unavailable:", type(e).__name__, e, flush=True)
         return None

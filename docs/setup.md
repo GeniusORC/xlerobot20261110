@@ -1188,3 +1188,84 @@ sqlite3 data/chat/chat.db 'select key,value from facts'
 
 Fallback chain when the LLM is unreachable: keyword table -> rule-based
 companion (`fallback_chat`). The service keeps talking offline.
+
+## 26. Barge-in (interrupt the robot) and vision in the chat context
+
+### Echo cancellation (system config, done once)
+
+The robot has to hear you while its own speaker is talking, otherwise it can
+never be interrupted. That needs acoustic echo cancellation:
+
+```bash
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cat > ~/.config/pipewire/pipewire.conf.d/90-echo-cancel.conf <<'CONF'
+context.modules = [
+    { name = libpipewire-module-echo-cancel
+      args = {
+          library.name = aec/libspa-aec-webrtc
+          source.props = {
+              node.name = "echo-cancel-source"
+              node.description = "Echo-cancelled microphone"
+          }
+          sink.props = {
+              node.name = "echo-cancel-sink"
+              node.description = "Echo-cancel reference sink"
+          }
+      }
+    }
+]
+CONF
+systemctl --user restart pipewire wireplumber
+wpctl status | sed -n '/Audio/,/Video/p'
+```
+
+The module `libpipewire-module-echo-cancel` (PipeWire 1.0.5 here) creates a
+virtual source + sink and they become the defaults, so `arecord -D default`
+and `aplay -D default` already go through it.
+
+Measured on this laptop, playing a TTS wav while recording both sources:
+
+| Recording source | RMS during playback |
+|---|---|
+| raw microphone | 0.73 |
+| echo-cancelled source | 0.015 |
+
+That is ~34 dB of suppression, enough for the VAD to ignore our own voice.
+
+Undo with `rm ~/.config/pipewire/pipewire.conf.d/90-echo-cancel.conf` and
+restarting PipeWire again.
+
+### Barge-in
+
+`voice_auto_web.play_audio()` now starts `aplay` with `Popen` and keeps the
+listener thread alive. While the robot speaks the VAD runs at 0.60 and needs
+four consecutive frames (~128 ms) before it terminates playback, logs
+`barge-in: stopped playback` and starts collecting the user's speech. The
+post-playback guard drops from 2.0 s to 0.4 s, and is skipped entirely after a
+barge-in so the first syllable is not lost.
+
+### Vision in the chat context
+
+`scripts/vision_context.py` fetches `/snapshot/head_npz` (colour + depth +
+intrinsics in one request), finds a face with a Haar cascade and reports it as
+one sentence:
+
+```
+看到一个人，距离约1.1米，在画面中间
+画面里有一个人，但背对或侧对着机器人，看不到正脸
+画面里没有看到正脸
+```
+
+Two physical filters keep the cascade honest, because it otherwise fires on
+bright wall patches:
+
+* **metric face width** — width = `face_px * depth / fx` must be 0.10–0.30 m;
+* **exposure** — a "face" with mean intensity > 245 is a light source.
+
+The sentence is injected as a system message every turn, so the model can
+answer "你看我气色怎么样" with what the camera actually sees instead of
+"I have no camera". A single call costs ~230 ms and is cached for 1.2 s.
+
+```bash
+.venv/bin/python scripts/vision_context.py     # dump state + sentence + latency
+```

@@ -30,6 +30,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import agent_brain
 import face_client as face
+import vision_context
 from voice_loop import tts, transcribe, vad_trim
 
 ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090")
@@ -313,8 +314,10 @@ def route_text(text: str) -> dict:
         return {**handle_intent("stop", text), "mode": "command",
                 "engine": "keyword"}
 
-    # One function-calling turn decides chat vs. robot action.
-    decision = agent_brain.decide(text, CHAT_HISTORY)
+    # One function-calling turn decides chat vs. robot action, with a one-line
+    # summary of what the head camera sees.
+    vision = vision_context.describe()
+    decision = agent_brain.decide(text, CHAT_HISTORY, context=vision)
     if decision is None:
         # LLM unreachable: keyword table, then the rule-based companion.
         intent = map_intent(text)
@@ -331,7 +334,7 @@ def route_text(text: str) -> dict:
             and not agent_brain.has_motion_words(text):
         # The model sometimes latches onto an earlier robot turn and calls a
         # movement tool while the user is just talking.  Re-ask without tools.
-        retry = agent_brain.chat_only(text, CHAT_HISTORY)
+        retry = agent_brain.chat_only(text, CHAT_HISTORY, context=vision)
         if retry and retry.get("reply"):
             decision = retry
             action = "chat"

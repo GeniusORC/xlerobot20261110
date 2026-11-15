@@ -53,6 +53,10 @@ LAST_SPOKEN = ""
 LAST_SPOKEN_AT = 0.0
 RECENT_SPOKEN = []  # (text, timestamp)
 
+# Playback handle so the listener can cut the robot off mid-sentence.
+PLAYBACK = {"proc": None, "barged": False}
+BARGE = {"hits": 0}
+
 # Anything that looks like a robot command must never be filtered as echo.
 COMMAND_WORDS = ("停", "前进", "后退", "左转", "右转", "过来", "报告",
                  "看我", "靠近", "走", "别动", "开始", "结束")
@@ -106,13 +110,22 @@ def play_audio(name):
     if not os.path.exists(path):
         return
     LISTEN_PAUSED.set()
+    proc = None
     try:
-        subprocess.run(["aplay", "-q", "-D", PLAYBACK_DEV, path], check=False)
+        # Popen instead of run() so a barge-in can terminate playback.
+        proc = subprocess.Popen(["aplay", "-q", "-D", PLAYBACK_DEV, path])
+        PLAYBACK["proc"] = proc
+        while proc.poll() is None:
+            time.sleep(0.02)
     except Exception as e:
         print("aplay failed:", e, flush=True)
     finally:
-        # Keep the mic muted for the room tail / echo after playback.
-        time.sleep(0.4)
+        PLAYBACK["proc"] = None
+        # Keep a short guard for the room tail, but skip it after a barge-in:
+        # the user is already talking and must not lose the first syllable.
+        if not PLAYBACK["barged"]:
+            time.sleep(0.4)
+        PLAYBACK["barged"] = False
         LISTEN_PAUSED.clear()
 
 
@@ -207,12 +220,38 @@ def listen_loop():
         x = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
         if LISTEN_PAUSED.is_set() or not LISTEN_ENABLED.is_set():
+            if not LISTEN_ENABLED.is_set():
+                # User switched listening off entirely.
+                with VAD_LOCK:
+                    vw.VAD.reset_states()
+                pre.clear()
+                speech = []
+                speaking = False
+                silence = 0
+                continue
+            # Paused only because the robot is speaking: keep the mic open so
+            # the user can cut in.  PipeWire echo cancellation has already
+            # removed our own TTS from this signal (~34 dB down).
+            pre.append(x)
             with VAD_LOCK:
-                vw.VAD.reset_states()
-            pre.clear()
-            speech = []
-            speaking = False
-            silence = 0
+                prob = vw.VAD(torch.from_numpy(x), SAMPLE_RATE).item()
+            BARGE["hits"] = BARGE["hits"] + 1 if prob > 0.60 else 0
+            if BARGE["hits"] >= 4:
+                proc = PLAYBACK["proc"]
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    print("barge-in: stopped playback", flush=True)
+                    face.emotion("listening", hold=8)
+                PLAYBACK["proc"] = None
+                PLAYBACK["barged"] = True
+                BARGE["hits"] = 0
+                LISTEN_PAUSED.clear()
+                speaking = True
+                speech = list(pre)
+                silence = 0
             continue
 
         with VAD_LOCK:
