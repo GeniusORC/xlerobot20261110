@@ -107,7 +107,7 @@ def main():
     ap.add_argument("--preflight", action="store_true",
                     help="read both Joy-Cons (sticks, buttons, gyro) without "
                          "connecting to the robot or moving anything")
-    ap.add_argument("--fps", type=float, default=30.0,
+    ap.add_argument("--fps", type=float, default=20.0,
                     help="control loop rate; the upstream loop has no sleep, "
                          "so it runs at ~50 Hz and overloads the motor bus")
     args, rest = ap.parse_known_args()
@@ -158,16 +158,33 @@ def main():
     mod.XLerobot2WheelsConfig = config
     mod.init_rerun = lambda *a, **k: None
 
-    # The upstream loop never calls precise_sleep, so it spins at ~50 Hz and
-    # every iteration does three full bus reads (left arm, right arm, head).
-    # On this robot that overruns the CH343 link: after ~3 minutes the bus
-    # stops answering (ConnectionError: no status packet).  log_rerun_data()
-    # is the last call in the loop, so pacing it there restores the --fps the
-    # example advertises without editing the upstream file.
+    # Upstream calls robot.get_observation() four times per iteration (right
+    # arm, left arm, head, plus the trailing observation) and send_action()
+    # reads three more times, so one iteration is ~15 sync_reads on a bus with
+    # eight motors.  At 20 Hz that overruns the CH343 link and bus1 stops
+    # answering after a minute or two.  Serve the repeated calls from one
+    # snapshot per iteration: all three controllers then act on the same state,
+    # which is what they assume anyway.
+    cls = mod.XLerobot2Wheels
+    original_get_observation = cls.get_observation
+    snapshot = {"valid": False, "obs": None}
+
+    def get_observation_once(self, *a, **k):
+        if not snapshot["valid"]:
+            snapshot["obs"] = original_get_observation(self, *a, **k)
+            snapshot["valid"] = True
+        return snapshot["obs"]
+
+    cls.get_observation = get_observation_once
+
+    # The upstream loop never calls precise_sleep, so it spins at ~50 Hz.
+    # log_rerun_data() is its last call: pace the loop there and drop the
+    # observation snapshot so the next iteration reads fresh state.
     from lerobot.utils.robot_utils import precise_sleep
     frame = 1.0 / max(args.fps, 1.0)
 
     def paced_log(*a, **k):
+        snapshot["valid"] = False
         precise_sleep(frame)
 
     mod.log_rerun_data = paced_log
