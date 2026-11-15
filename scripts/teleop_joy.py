@@ -13,11 +13,21 @@ Two backends:
 
 Default mapping (change with the flags below):
 
-  left stick  up/down    -> forward / backward   (axis 1)
-  right stick left/right -> turn left / right    (axis 3)
-  A / cross              -> stop
-  B / circle             -> emergency stop
-  Start / options        -> quit
+  left stick   up/down    -> forward / backward
+  left stick   left/right -> turn left / right (single-stick mode)
+  left d-pad   up/down    -> head tilt up / down
+  left d-pad   left/right -> head pan left / right
+  right A                 -> stop (centre the stick to drive again)
+  right B                 -> emergency stop
+  right X                 -> cycle speed preset
+  right Y                 -> health station auto-aim (自动取景)
+  right R (shoulder)      -> centre the head
+  right ZR (trigger)      -> start a 10 s capture
+  right +                 -> quit
+  right stick click       -> print robot/health status
+
+Bindings accept a symbolic name (``R:A``) or a raw button number, e.g.
+``--btn-aim 3``.  Use ``--probe`` to see the names your pad reports.
 
 Every joystick node is opened, so a Joy-Con pair works as two devices: the
 left stick drives and the right stick turns.  A single Joy-Con uses its one
@@ -67,7 +77,8 @@ class JoyState:
 
     def __init__(self):
         self.axes = {}
-        self.buttons = {}
+        self.buttons = {}       # numeric key (offset + number) -> bool
+        self.named = {}         # "L:UP", "R:A", ... -> bool
         self.quit = False
         self.estop = False
         self.last_event = time.time()
@@ -78,10 +89,61 @@ class JoyState:
             self.axes[number] = float(value)
             self.last_event = time.time()
 
-    def set_button(self, number, pressed):
+    def set_button(self, number, name, pressed):
         with self.lock:
             self.buttons[number] = bool(pressed)
+            if name:
+                self.named[name] = bool(pressed)
             self.last_event = time.time()
+
+
+# Joy-Con button names per backend, so bindings can be written as "R:A"
+# instead of a fragile raw number.  The js API numbers buttons in the order the
+# driver declares them, which is ascending key code.
+JOYCON_JS_BTN = {
+    "l": {0: "ZL", 1: "R", 2: "ZR", 3: "R2", 4: "ZR2", 5: "MINUS",
+          6: "STICK", 7: "UP", 8: "DOWN", 9: "LEFT", 10: "RIGHT"},
+    "r": {0: "A", 1: "B", 2: "X", 3: "Y", 4: "R", 5: "ZR", 6: "R2",
+          7: "ZR2", 8: "PLUS", 9: "HOME", 10: "STICK"},
+}
+
+BTN_ALIASES = {
+    "SOUTH": "A", "EAST": "B", "NORTH": "X", "WEST": "Y",
+    "TL": "R", "TR": "ZR", "TL2": "R2", "TR2": "ZR2",
+    "START": "PLUS", "SELECT": "MINUS", "MODE": "HOME",
+    "THUMBL": "STICK", "THUMBR": "STICK", "Z": "ZL",
+    "DPAD_UP": "UP", "DPAD_DOWN": "DOWN",
+    "DPAD_LEFT": "LEFT", "DPAD_RIGHT": "RIGHT",
+}
+
+
+def device_label(name, index):
+    """Short stable prefix: L / R for a Joy-Con pair, D<idx> otherwise."""
+    low = (name or "").lower()
+    if "joy-con" in low:
+        if "(l)" in low or low.endswith("l)"):
+            return "L"
+        if "(r)" in low or low.endswith("r)"):
+            return "R"
+    return f"D{index}"
+
+
+def js_btn_map(name):
+    low = (name or "").lower()
+    if "joy-con" in low and "(l)" in low:
+        return JOYCON_JS_BTN["l"]
+    if "joy-con" in low and "(r)" in low:
+        return JOYCON_JS_BTN["r"]
+    return {}
+
+
+def evdev_btn_name(code, ecodes):
+    raw = ecodes.BTN.get(code) or ecodes.KEY.get(code)
+    if not isinstance(raw, str):
+        return None
+    if raw.startswith("BTN_"):
+        raw = raw[4:]
+    return BTN_ALIASES.get(raw, raw)
 
 
 # --------------------------------------------------------------------------
@@ -99,7 +161,7 @@ def js_name(path):
         return "?"
 
 
-def read_js(path, state, offset, quit_btn, estop_btn, stop_btn, verbose=False):
+def read_js(path, state, offset, label, btn_map, verbose=False):
     """Read 8-byte ``js_event`` structs until the file closes.
 
     ``offset`` namespaces this device's axes/buttons (0, 100, 200, ...) so a
@@ -133,20 +195,13 @@ def read_js(path, state, offset, quit_btn, estop_btn, stop_btn, verbose=False):
                         print(f"AXIS  {offset + number:3d}  {value:+6d}", flush=True)
                 elif etype == JS_EVENT_BUTTON:
                     pressed = value != 0
-                    state.set_button(offset + number, pressed)
+                    sym = btn_map.get(number)
+                    full = f"{label}:{sym}" if sym else "?"
+                    state.set_button(offset + number,
+                                     full if sym else None, pressed)
                     if verbose:
-                        print(f"BTN   {offset + number:3d}  "
+                        print(f"BTN   {offset + number:3d}  {full:8} "
                               f"{'down' if pressed else 'up'}", flush=True)
-                    if pressed:
-                        if quit_btn is not None and offset + number == quit_btn:
-                            state.quit = True
-                        elif (estop_btn is not None
-                              and offset + number == estop_btn):
-                            state.estop = True
-                        elif (stop_btn is not None
-                              and offset + number == stop_btn):
-                            with state.lock:
-                                state.axes.clear()
     finally:
         try:
             os.close(fd)
@@ -178,8 +233,7 @@ def evdev_devices():
     return out
 
 
-def read_evdev(path, state, offset, quit_btn, estop_btn, stop_btn,
-               verbose=False):
+def read_evdev(path, state, offset, label, btn_map, verbose=False):
     import evdev
     from evdev import ecodes
     try:
@@ -192,11 +246,6 @@ def read_evdev(path, state, offset, quit_btn, estop_btn, stop_btn,
         ecodes.ABS_RX: 2, ecodes.ABS_RY: 3,
         ecodes.ABS_Z: 4, ecodes.ABS_RZ: 5,
         ecodes.ABS_HAT0X: 6, ecodes.ABS_HAT0Y: 7,
-    }
-    btn_names = {
-        ecodes.BTN_SOUTH: 0, ecodes.BTN_A: 0,
-        ecodes.BTN_EAST: 1, ecodes.BTN_B: 1,
-        ecodes.BTN_START: 8, ecodes.BTN_SELECT: 9,
     }
     try:
         for ev in dev.read_loop():
@@ -217,20 +266,14 @@ def read_evdev(path, state, offset, quit_btn, estop_btn, stop_btn,
                     print(f"ABS   {ecodes.ABS.get(ev.code, ev.code)} -> {n} "
                           f"{value:+.2f}", flush=True)
             elif ev.type == ecodes.EV_KEY:
-                n = offset + btn_names.get(ev.code, ev.code)
+                n = offset + btn_map.get(ev.code, ev.code)
                 pressed = ev.value != 0
-                state.set_button(n, pressed)
+                sym = evdev_btn_name(ev.code, ecodes)
+                full = f"{label}:{sym}" if sym else "?"
+                state.set_button(n, full if sym else None, pressed)
                 if verbose:
-                    print(f"KEY   {ecodes.BTN.get(ev.code, ev.code)} -> {n} "
-                          f"{'down' if pressed else 'up'}", flush=True)
-                if pressed:
-                    if quit_btn is not None and n == quit_btn:
-                        state.quit = True
-                    elif estop_btn is not None and n == estop_btn:
-                        state.estop = True
-                    elif stop_btn is not None and n == stop_btn:
-                        with state.lock:
-                            state.axes.clear()
+                    print(f"KEY   {ecodes.BTN.get(ev.code, ev.code)} -> "
+                          f"{full:8} {'down' if pressed else 'up'}", flush=True)
     except Exception as e:
         print(f"evdev read stopped: {type(e).__name__}: {e}", flush=True)
     finally:
@@ -274,11 +317,47 @@ def post_stop(dry_run=False):
 
 
 def follow_is_on():
+    return bool(health_status().get("follow"))
+
+
+def health_status():
     try:
-        r = requests.get(f"{HEALTH_API}/api/status", timeout=0.5)
-        return bool(r.json().get("follow"))
+        r = requests.get(f"{HEALTH_API}/api/status", timeout=1.0)
+        return r.json()
     except Exception:
-        return False
+        return {}
+
+
+def health_post(path, payload=None, dry_run=False):
+    if dry_run:
+        print(f"[dry-run] POST {path} {payload or {}}", flush=True)
+        return {"dry_run": True}
+    try:
+        r = requests.post(f"{HEALTH_API}{path}", json=payload or {}, timeout=3.0)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": r.status_code}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def post_head(dry_run=False, **kw):
+    if dry_run:
+        print(f"[dry-run] HEAD {kw}", flush=True)
+        return
+    try:
+        requests.post(f"{ROBOT_API}/head", json=kw, timeout=0.5)
+    except Exception:
+        pass
+
+
+def robot_status():
+    try:
+        r = requests.get(f"{ROBOT_API}/status", timeout=1.0)
+        return r.json()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def connect_bluetooth(match="joy-con", wait=6.0):
@@ -352,9 +431,27 @@ def main():
                     help="m/s (robot_api clamps to -0.22..0.30)")
     ap.add_argument("--max-theta", type=float, default=25.0,
                     help="deg/s (robot_api clamps to +-25)")
-    ap.add_argument("--stop-btn", type=int, default=0)
-    ap.add_argument("--estop-btn", type=int, default=1)
-    ap.add_argument("--quit-btn", type=int, default=8)
+    ap.add_argument("--btn-stop", default="R:A",
+                    help="stop button (name like R:A, or a raw number)")
+    ap.add_argument("--btn-estop", default="R:B",
+                    help="emergency stop button")
+    ap.add_argument("--btn-quit", default="R:PLUS", help="quit button")
+    ap.add_argument("--btn-speed", default="R:X",
+                    help="cycle the speed preset")
+    ap.add_argument("--btn-aim", default="R:Y",
+                    help="health station auto-aim (自动取景)")
+    ap.add_argument("--btn-center", default="R:R", help="centre the head")
+    ap.add_argument("--btn-capture", default="R:ZR",
+                    help="start a 10 s capture in the health station")
+    ap.add_argument("--btn-status", default="R:STICK",
+                    help="print robot/health status")
+    ap.add_argument("--no-actions", action="store_true",
+                    help="drive only, ignore every button binding")
+    ap.add_argument("--head-step", type=float, default=3.0,
+                    help="head units per tick while a d-pad button is held")
+    ap.add_argument("--head-rate", type=float, default=8.0,
+                    help="head command rate in Hz")
+    ap.add_argument("--capture-seconds", type=float, default=10.0)
     ap.add_argument("--rate", type=float, default=20.0, help="Hz")
     ap.add_argument("--connect", action="store_true",
                     help="connect already-paired Bluetooth Joy-Cons first")
@@ -454,24 +551,40 @@ def main():
     print(f"mapping: axis x={args.axis_x} theta={args.axis_theta} "
           f"deadzone={args.deadzone} invert=({args.invert_x},"
           f"{args.invert_theta})", flush=True)
+    if not args.no_actions:
+        print("buttons: stop={} estop={} speed={} aim={} centre={} "
+              "capture={} status={} quit={}".format(
+                  args.btn_stop, args.btn_estop, args.btn_speed, args.btn_aim,
+                  args.btn_center, args.btn_capture, args.btn_status,
+                  args.btn_quit), flush=True)
+        print("head: left d-pad up/down/left/right", flush=True)
     if args.takeover:
         try:
             requests.post(f"{HEALTH_API}/api/follow", json={"on": False},
                           timeout=0.8)
-            print("health station follow: off", flush=True)
+            requests.post(f"{HEALTH_API}/api/track", json={"on": False},
+                          timeout=0.8)
+            print("health station follow + head tracking: off", flush=True)
         except Exception as e:
-            print("could not turn follow off:", e, flush=True)
-    elif follow_is_on():
-        print("WARNING: 采集时跟随 is on in the health station; turn it off "
-              "or it will fight the joystick.", flush=True)
+            print("could not take over from the health station:", e, flush=True)
+    else:
+        hs = health_status()
+        if hs.get("follow"):
+            print("WARNING: 采集时跟随 is on in the health station; use "
+                  "--takeover or it will fight the joystick.", flush=True)
+        if hs.get("track"):
+            print("WARNING: head tracking is on; it will fight the d-pad head "
+                  "control. Use --takeover to switch it off.", flush=True)
 
     state = JoyState()
     readers = []
     for i, (p, b) in enumerate(devices):
+        dev_name = js_name(p) if b == "js" else ""
+        label_i = device_label(dev_name, i)
+        btn_map = js_btn_map(dev_name) if b == "js" else {}
         t = threading.Thread(
             target=(read_js if b == "js" else read_evdev),
-            args=(p, state, i * 100, args.quit_btn, args.estop_btn,
-                  args.stop_btn, args.probe),
+            args=(p, state, i * 100, label_i, btn_map, args.probe),
             daemon=True)
         t.start()
         readers.append(t)
@@ -504,6 +617,32 @@ def main():
         span = max(1e-3, 1.0 - abs(c))
         return max(-1.0, min(1.0, (raw - c) / span))
 
+    # Speed presets: start at the requested maximum, then faster (still inside
+    # robot_api's clamps).
+    presets = [(args.max_x, args.max_theta)]
+    for factor in (1.6, 2.4):
+        presets.append((min(args.max_x * factor, 0.30),
+                        min(args.max_theta * 1.5, 25.0)))
+    speed_i = 0
+
+    specs = [args.btn_stop, args.btn_estop, args.btn_quit, args.btn_speed,
+             args.btn_aim, args.btn_center, args.btn_capture, args.btn_status]
+
+    def down(spec):
+        """True if a binding is held; accepts 'R:A' or a raw button number."""
+        if spec is None:
+            return False
+        s = str(spec)
+        if s.lstrip("-").isdigit():
+            return bool(btns.get(int(s), False))
+        return bool(named.get(s, False))
+
+    def edge(spec):
+        return down(spec) and not prev.get(spec, False)
+
+    prev = {}
+    stop_latched = False
+    head_next = 0.0
     sent = False
     last_print = 0.0
     try:
@@ -517,14 +656,73 @@ def main():
                 break
             with state.lock:
                 ax = dict(state.axes)
+                named = dict(state.named)
+                btns = dict(state.buttons)
+
+            if not args.no_actions:
+                if edge(args.btn_quit):
+                    print("quit button pressed", flush=True)
+                    break
+                if edge(args.btn_estop):
+                    state.estop = True
+                if edge(args.btn_stop):
+                    post_velocity(0.0, 0.0, args.dry_run)
+                    sent = False
+                    stop_latched = True
+                    print("STOP - centre the stick to drive again", flush=True)
+                if edge(args.btn_speed):
+                    speed_i = (speed_i + 1) % len(presets)
+                    print(f"speed {speed_i + 1}/{len(presets)}: "
+                          f"{presets[speed_i][0]:.2f} m/s, "
+                          f"{presets[speed_i][1]:.0f} deg/s", flush=True)
+                if edge(args.btn_aim):
+                    print("auto-aim:", health_post("/api/aim", {},
+                                                   args.dry_run), flush=True)
+                if edge(args.btn_center):
+                    print("head centre", flush=True)
+                    post_head(args.dry_run, center=True)
+                if edge(args.btn_capture):
+                    print("capture:", health_post(
+                        "/api/start", {"duration": args.capture_seconds},
+                        args.dry_run), flush=True)
+                if edge(args.btn_status):
+                    st = robot_status()
+                    hs = health_status()
+                    print(f"status: robot={'up' if 'error' not in st else st} "
+                          f"x={st.get('x_vel')} theta={st.get('theta_vel')} | "
+                          f"follow={hs.get('follow')} track={hs.get('track')} "
+                          f"dist={hs.get('distance_m')}", flush=True)
+
+                # Head: hold a d-pad direction to pan/tilt in small steps.
+                now = time.time()
+                if now >= head_next:
+                    dpan = dtilt = 0.0
+                    if down("L:LEFT"):
+                        dpan -= args.head_step
+                    if down("L:RIGHT"):
+                        dpan += args.head_step
+                    if down("L:UP"):
+                        dtilt -= args.head_step
+                    if down("L:DOWN"):
+                        dtilt += args.head_step
+                    if dpan or dtilt:
+                        post_head(args.dry_run, dpan=dpan, dtilt=dtilt)
+                        head_next = now + 1.0 / max(args.head_rate, 1.0)
+
             x = deadzone(axis_value(args.axis_x), args.deadzone)
             th = deadzone(axis_value(args.axis_theta), args.deadzone)
             if args.invert_x:
                 x = -x
             if args.invert_theta:
                 th = -th
-            vx = x * args.max_x
-            vth = th * args.max_theta
+            vx = x * presets[speed_i][0]
+            vth = th * presets[speed_i][1]
+            if stop_latched:
+                if abs(x) < 0.1 and abs(th) < 0.1:
+                    stop_latched = False
+                    print("stop released", flush=True)
+                else:
+                    vx = vth = 0.0
             if args.verbose and time.time() - last_print > 0.5:
                 if abs(vx) > 0.005 or abs(vth) > 0.2:
                     print(f"x={vx:+.2f} m/s  theta={vth:+6.1f} deg/s",
@@ -537,6 +735,8 @@ def main():
             else:
                 post_velocity(vx, vth, args.dry_run)
                 sent = True
+            for spec in specs:
+                prev[spec] = down(spec)
             time.sleep(period)
     except KeyboardInterrupt:
         pass

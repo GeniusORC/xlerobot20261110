@@ -956,6 +956,31 @@ Default mapping: left stick up/down = forward/back, right stick left/right =
 turn, A = stop, B = emergency stop, Start = quit. Use `--axis-x`,
 `--axis-theta`, `--invert-x`, `--invert-theta` to match a different pad.
 
+With a Joy-Con pair the buttons do more than drive:
+
+| Input | Action |
+|---|---|
+| left stick | forward/back + turn |
+| left d-pad up/down | head tilt up/down |
+| left d-pad left/right | head pan left/right |
+| right **A** | stop (centre the stick to drive again) |
+| right **B** | emergency stop |
+| right **X** | cycle speed preset (slow → medium → fast) |
+| right **Y** | health station auto-aim (自动取景) |
+| right **R** shoulder | centre the head |
+| right **ZR** trigger | start a 10 s capture |
+| right **＋** | quit |
+| right stick click | print robot + health status |
+
+Each binding accepts a symbolic name (`R:A`) or a raw number (`3`):
+`--btn-stop`, `--btn-estop`, `--btn-quit`, `--btn-speed`, `--btn-aim`,
+`--btn-center`, `--btn-capture`, `--btn-status`. `--no-actions` disables all
+of them and leaves only driving. Head steps are tuned with `--head-step`
+(default 3 units per tick) and `--head-rate` (8 Hz).
+
+`--takeover` turns off both the health station's 采集时跟随 and its head
+tracking, so the joystick is in full control.
+
 Every joystick node is opened at once, so a Joy-Con **pair** works as two
 devices: left stick drives, right stick turns. The second device's numbers are
 offset by 100 (`theta=100` on the `js` backend, `102` on `evdev`). A single
