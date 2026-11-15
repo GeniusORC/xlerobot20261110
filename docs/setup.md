@@ -1020,3 +1020,73 @@ bluetoothctl
 After that, `teleop_joy.py --connect` reconnects both pads in one step. A
 Joy-Con that has gone to sleep still has to be woken by pressing a button on
 it; BlueZ cannot wake it, and reports `br-connection-create-socket` until then.
+
+## 23. Official Joy-Con teleop (arms + head + base)
+
+`XLeRobot/software/examples/7_xlerobot_2wheels_teleop_joycon.py` is the
+upstream full-body Joy-Con teleop. Run it through the launcher so this robot's
+geometry and ports are used and the upstream bus-overload bugs are worked
+around:
+
+```bash
+# 1. one-time system setup (needs root)
+sudo apt install -y libhidapi-hidraw0
+sudo tee /etc/udev/rules.d/70-joycon.rules >/dev/null <<'RULE'
+SUBSYSTEM=="hidraw", ATTRS{modalias}=="hid:b0005*v0000057Ep00002006", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{modalias}=="hid:b0005*v0000057Ep00002007", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{modalias}=="hid:b0005*v0000057Ep00002009", MODE="0666", TAG+="uaccess"
+RULE
+sudo udevadm control --reload-rules && sudo udevadm trigger
+# 2. python side: the ctypes build, not the hidapi wheel (USB backend only)
+uv pip install --python .venv-robot/bin/python hid PyGLM scipy
+```
+
+Then:
+
+```bash
+# robot_api owns the serial ports; stop it first
+kill $(cat /tmp/opencode/robot_api.pid)
+
+.venv-robot/bin/python scripts/teleop_joycon_official.py --check-only
+.venv-robot/bin/python scripts/teleop_joycon_official.py --preflight
+.venv-robot/bin/python scripts/teleop_joycon_official.py --fps 20
+```
+
+Control map (official):
+
+| Input | Action |
+|---|---|
+| right Y / A | forward / backward (ramped) |
+| right X / B | turn left / right (ramped) |
+| right stick | right arm end-effector X/Z and Y |
+| right R / stick click | right arm Z up / down |
+| right ZR | toggle + ramp the right gripper |
+| left stick | left arm end-effector |
+| left L / stick click | left arm Z up / down |
+| left ZL | toggle + ramp the left gripper |
+| left d-pad | head tilt (up/down) and pan (left/right) |
+| right ＋ | both arms and head to the zero pose |
+
+Two upstream issues the launcher patches without editing the example:
+
+1. The loop imports `precise_sleep` and accepts `--fps` but never calls either,
+   so it spins at ~50 Hz. The launcher paces it through `log_rerun_data`
+   (the last call in the loop) at `--fps`, default 20.
+2. Each iteration calls `get_observation()` four times and `send_action()`
+   reads three more, i.e. ~15 sync reads on a bus with eight motors. At 20 Hz
+   bus1 (left arm + head) stopped answering after 1-2 minutes
+   (`ConnectionError: no status packet`). The launcher serves all four calls
+   from one snapshot per iteration, bringing it down to ~6 reads like
+   `robot_api.py`.
+
+`--preflight` opens both Joy-Cons, runs the gyro calibration and prints pose
+and buttons without connecting to the robot.
+
+Note: the official teleop and `robot_api.py` both need exclusive access to
+`/dev/xlerobot_serial_a|b`, so the health station and voice robot commands are
+unavailable while it runs. Restart `robot_api.py` afterwards:
+
+```bash
+nohup .venv-robot/bin/python scripts/robot_api.py --port 8090 \
+  > /tmp/opencode/robot_api.log 2>&1 & echo $! > /tmp/opencode/robot_api.pid
+```
