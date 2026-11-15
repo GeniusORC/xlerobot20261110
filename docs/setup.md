@@ -934,3 +934,51 @@ Recommended sequence:
 3. Press **采集时跟随**, then **开始采集 10 s** and walk naturally.
 4. The base keeps the standoff; if you walk toward it, it backs away at up to
    0.2 m/s. Remove obstacles behind the robot first — there is no rear sensor.
+
+## 22. Joystick / gamepad teleop
+
+`scripts/teleop_joy.py` drives the base from any Linux joystick. It uses the
+same short-lease `/velocity` endpoint as the follower, refreshed at 20 Hz, so
+releasing the stick, unplugging the controller or killing the script stops the
+robot within 0.6 s.
+
+```bash
+source scripts/env.sh robot
+python scripts/teleop_joy.py --list        # what is connected?
+python scripts/teleop_joy.py --probe       # print raw axis/button numbers
+python scripts/teleop_joy.py --takeover    # drive (turns follow off first)
+python scripts/teleop_joy.py --single-stick # one Joy-Con: stick X/Y only
+python scripts/teleop_joy.py --dry-run     # print velocities, no motion
+```
+
+Default mapping: left stick up/down = forward/back, right stick left/right =
+turn, A = stop, B = emergency stop, Start = quit. Use `--axis-x`,
+`--axis-theta`, `--invert-x`, `--invert-theta` to match a different pad.
+
+Two backends:
+
+* **js** (`/dev/input/js*`) — used automatically when present. Usually
+  world-readable, no group change needed.
+* **evdev** (`/dev/input/event*`) — needed for Bluetooth controllers such as a
+  Nintendo Joy-Con. The user must be able to read the event node. Either add
+  the user to the `input` group (then log out/in), or add a udev rule:
+
+  ```bash
+  echo 'SUBSYSTEM=="input", ENV{ID_INPUT_JOYSTICK}=="1", MODE="0660", GROUP="plugdev"' \
+    | sudo tee /etc/udev/rules.d/99-xlerobot-joystick.rules
+  sudo udevadm control --reload-rules && sudo udevadm trigger
+  ```
+
+Axis centres are learned at startup, so a trigger that rests at −1 does not
+drive the base. If the reader thread dies (controller unplugged) the script
+sends a stop instead of repeating the last command.
+
+Pairing a Bluetooth Joy-Con:
+
+```bash
+bluetoothctl
+> scan on
+> pair <MAC>
+> trust <MAC>
+> connect <MAC>
+```

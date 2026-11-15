@@ -58,6 +58,10 @@ to use the real LLM; otherwise the local companion fallback is used.
 # Head pan/tilt hardware test (power the robot, start robot_api.py first)
 .venv/bin/python scripts/test_head.py --move
 
+# Joystick / gamepad teleop (start robot_api.py first)
+.venv-robot/bin/python scripts/teleop_joy.py --list
+.venv-robot/bin/python scripts/teleop_joy.py --takeover
+
 # Voice loop (built-in mic; use headset/USB array mic for far field)
 .venv/bin/python scripts/voice_loop.py --record 5
 
