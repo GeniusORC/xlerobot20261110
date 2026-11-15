@@ -946,6 +946,7 @@ robot within 0.6 s.
 source scripts/env.sh robot
 python scripts/teleop_joy.py --list        # what is connected?
 python scripts/teleop_joy.py --probe       # print raw axis/button numbers
+python scripts/teleop_joy.py --connect     # connect paired Joy-Cons, then drive
 python scripts/teleop_joy.py --takeover    # drive (turns follow off first)
 python scripts/teleop_joy.py --single-stick # one Joy-Con: stick X/Y only
 python scripts/teleop_joy.py --dry-run     # print velocities, no motion
@@ -954,6 +955,14 @@ python scripts/teleop_joy.py --dry-run     # print velocities, no motion
 Default mapping: left stick up/down = forward/back, right stick left/right =
 turn, A = stop, B = emergency stop, Start = quit. Use `--axis-x`,
 `--axis-theta`, `--invert-x`, `--invert-theta` to match a different pad.
+
+Every joystick node is opened at once, so a Joy-Con **pair** works as two
+devices: left stick drives, right stick turns. The second device's numbers are
+offset by 100 (`theta=100` on the `js` backend, `102` on `evdev`). A single
+Joy-Con uses its one stick. Joy-Con sticks are auto-inverted so up = forward and
+left = left; pass `--no-auto-invert` to keep the raw polarity. If the chosen
+axis is not reported, the script prints the axes it did see and the matching
+`--axis-x` / `--axis-theta` to pass.
 
 Two backends:
 
@@ -982,3 +991,7 @@ bluetoothctl
 > trust <MAC>
 > connect <MAC>
 ```
+
+After that, `teleop_joy.py --connect` reconnects both pads in one step. A
+Joy-Con that has gone to sleep still has to be woken by pressing a button on
+it; BlueZ cannot wake it, and reports `br-connection-create-socket` until then.
