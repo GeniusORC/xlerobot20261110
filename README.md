@@ -126,9 +126,14 @@ ros2 launch realsense2_camera rs_launch.py \
   with `INVERT_LINEAR_DIRECTION = True` (x only, rotation unchanged); re-apply
   with `./scripts/apply_xlerobot_patches.sh`.
 - D455 is now the head camera (serial `333422300185`, color + aligned depth via
-  RealSense SDK). Wrist mapping changed after the swap: left `/dev/video2`,
-  right `/dev/video0`. Only one process can own the D455 at a time
-  (`camera_web.py` vs. LeRobot camera connections).
+  RealSense SDK). Only one process can own the D455 at a time
+  (`camera_web.py` vs. LeRobot camera connections). If it wedges
+  (`xioctl(VIDIOC_S_FMT) failed`), send `device.hardware_reset()` and wait ~8 s.
+- The two wrist cameras are addressed by **USB port**, not `/dev/videoN`
+  (indices move on every re-enumeration): left = `by-path/...usb-0:1.2...`,
+  right = `...usb-0:2.2...`. Both are identical Sonix `USB2.0_CAM1` units with
+  no serial number, so the port is the only stable identity. See
+  `docs/setup.md` §30.
 - Motor-bus mapping (1 Mbaud):
   - `/dev/xlerobot_serial_b` → IDs 1–8 → **bus1** (left arm + head), use as `port1`
   - `/dev/xlerobot_serial_a` → IDs 1–6, 9, 10 → **bus2** (right arm + 2 wheels), use as `port2`

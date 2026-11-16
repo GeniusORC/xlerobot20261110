@@ -10,6 +10,7 @@ before starting this server, or use a separate process for robot recording.
 """
 import argparse
 import io
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,10 +25,37 @@ except Exception:
     rs = None
 
 HEAD_D455_SERIAL = "333422300185"
-WRISTS = {
-    "left": "/dev/video2",
-    "right": "/dev/video0",
+
+# /dev/videoN is enumeration order: on 2026-11-16 the wrist cameras came back
+# as video8/video10 and "right" (video0) was the laptop webcam.  Both wrists
+# are identical Sonix USB2.0_CAM1 units with no serial, so the USB port is the
+# only stable identity.  Port 1.2 is the left arm, 2.2 the right (verified by
+# moving the left arm and watching which image changed).
+WRIST_PATHS = {
+    "left": [
+        "/dev/xlerobot_cam_left",          # optional udev rule
+        "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1.2:1.0-video-index0",
+    ],
+    "right": [
+        "/dev/xlerobot_cam_right",
+        "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.2:1.0-video-index0",
+    ],
 }
+
+
+def wrist_dev(which):
+    """First existing candidate.  No /dev/videoN fallback: a wrong camera is
+    worse than a visible error."""
+    override = os.environ.get(f"CAM_{which.upper()}")
+    if override:
+        return override
+    for path in WRIST_PATHS[which]:
+        if os.path.exists(path):
+            return path
+    return WRIST_PATHS[which][0]
+
+
+WRISTS = {name: wrist_dev(name) for name in WRIST_PATHS}
 
 
 class OpenCVCamera:

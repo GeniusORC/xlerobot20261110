@@ -1,0 +1,59 @@
+--- a/software/plugins/lerobot_robot_xlerobot_2wheels/lerobot_robot_xlerobot_2wheels/config_xlerobot_2wheels.py
++++ b/software/plugins/lerobot_robot_xlerobot_2wheels/lerobot_robot_xlerobot_2wheels/config_xlerobot_2wheels.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ from dataclasses import dataclass, field
++import os
+ 
+ from lerobot.cameras.configs import CameraConfig, Cv2Rotation, ColorMode
+ from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+@@ -21,19 +22,44 @@
+ from lerobot.robots.config import RobotConfig
+ 
+ 
++def _wrist_path(which: str) -> str:
++    """Stable path for a wrist camera.
++
++    /dev/videoN is assigned in enumeration order, so re-plugging a camera (or
++    the D455 re-enumerating) silently moved "right" onto the laptop webcam on
++    2026-11-16.  Both wrist cameras are identical Sonix USB2.0_CAM1 units with
++    no serial number, so the only stable identity is the USB port they are
++    plugged into, which is what /dev/v4l/by-path encodes.
++    """
++    candidates = {
++        "left": [
++            "/dev/xlerobot_cam_left",  # optional udev rule
++            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1.2:1.0-video-index0",
++        ],
++        "right": [
++            "/dev/xlerobot_cam_right",
++            "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.2:1.0-video-index0",
++        ],
++    }[which]
++    for path in candidates:
++        if os.path.exists(path):
++            return path
++    return candidates[0]
++
++
+ def xlerobot_2wheels_cameras_config() -> dict[str, CameraConfig]:
+     return {
+-        # Wrist cameras shifted device nodes after the D455 replaced the old
+-        # head camera: left wrist is now video2, right wrist is video0.
++        # Port 1.2 is the left arm, 2.2 the right (verified by moving the left
++        # arm and watching which image changed).
+         "left_wrist": OpenCVCameraConfig(
+-            index_or_path="/dev/video2",
++            index_or_path=_wrist_path("left"),
+             fps=30,
+             width=640,
+             height=480,
+             rotation=Cv2Rotation.NO_ROTATION,
+         ),
+         "right_wrist": OpenCVCameraConfig(
+-            index_or_path="/dev/video0",
++            index_or_path=_wrist_path("right"),
+             fps=30,
+             width=640,
+             height=480,

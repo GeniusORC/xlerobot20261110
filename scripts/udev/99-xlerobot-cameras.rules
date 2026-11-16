@@ -1,0 +1,14 @@
+# Stable names for the two wrist cameras (optional convenience).
+#
+# /dev/videoN is enumeration order, so re-plugging a camera silently moved
+# "right" onto the laptop webcam on 2026-11-16.  The code already resolves
+# /dev/v4l/by-path/... which needs no root; these symlinks are just nicer to
+# type.  Both wrists are identical Sonix USB2.0_CAM1 units with no serial, so
+# the USB port is the only stable identity.
+#
+#   sudo cp scripts/udev/99-xlerobot-cameras.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=video4linux
+#
+# 1.2 -> left wrist (verified by moving the left arm), 2.2 -> right wrist.
+SUBSYSTEM=="video4linux", ENV{ID_V4L_CAPABILITIES}==":capture:", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:1.2:1.0", SYMLINK+="xlerobot_cam_left", MODE="0666", GROUP="video"
+SUBSYSTEM=="video4linux", ENV{ID_V4L_CAPABILITIES}==":capture:", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:2.2:1.0", SYMLINK+="xlerobot_cam_right", MODE="0666", GROUP="video"

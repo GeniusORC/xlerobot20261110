@@ -1466,3 +1466,106 @@ the reply says so instead of promising to follow.
 * depth comes from the face, so a very close face (< 0.4 m) is unreliable;
 * the base is two-wheel differential with no odometry in this loop: distance is
   closed on the camera, not on wheel counts.
+
+## 30. Camera identity: by-path, not `/dev/videoN`
+
+On 2026-11-16 the web view showed the laptop webcam as `right` and nothing at
+all as `left`. Nothing in the code had changed — the device indices had.
+
+`/dev/videoN` is assigned in enumeration order. Re-plugging a wrist camera, or
+the D455 re-enumerating after a reset, shifts every index after it. The day it
+broke, the mapping was:
+
+| Role | Before | That day |
+|---|---|---|
+| left wrist | `/dev/video2` | `/dev/video8` → later `/dev/video3` |
+| right wrist | `/dev/video0` | `/dev/video10` |
+| laptop webcam | `/dev/video4` | `/dev/video0` ← silently became "right" |
+
+Both wrist cameras are the same Sonix `USB2.0_CAM1` unit with the same
+`ID_SERIAL`, so `by-id` cannot tell them apart either. The only stable identity
+is the **USB port** they are plugged into:
+
+```text
+1.2 -> left wrist     2.2 -> right wrist     (verified, see below)
+3   -> D455 head (accessed by serial, not by node)
+```
+
+### Which port is which arm
+
+Do not trust the silkscreen. Prove it:
+
+```bash
+fuser -k 8090/tcp                      # robot_api owns the serial bus
+.venv-robot/bin/python scripts/identify_wrist_cameras.py
+```
+
+The script captures both wrist cameras, swings `left_arm_shoulder_pan` by 6
+units, captures again, and prints the mean absolute pixel difference. The
+camera on the moved arm changes much more (measured 51.5 vs 22.8). It restores
+the arm position and disconnects. Frames are written to
+`/tmp/opencode/ident_{a,b}_{before,after}.jpg` if you want to look.
+
+### The fix
+
+`scripts/camera_web.py` and the LeRobot plugin config now resolve the port:
+
+```python
+WRIST_PATHS = {
+    "left":  ["/dev/xlerobot_cam_left",
+              "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1.2:1.0-video-index0"],
+    "right": ["/dev/xlerobot_cam_right",
+              "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.2:1.0-video-index0"],
+}
+```
+
+* there is **no `/dev/videoN` fallback**: a wrong camera is worse than a visible
+  503, and the fallback is exactly what put the laptop webcam in the wrist view;
+* `CAM_LEFT` / `CAM_RIGHT` environment variables override the path;
+* the plugin change is `patches/0003-stable-wrist-camera-paths.patch`
+  (re-apply with `./scripts/apply_xlerobot_patches.sh`).
+
+Optional, nicer names — the code does not need it, but it is easier to type:
+
+```bash
+sudo cp scripts/udev/99-xlerobot-cameras.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=video4linux
+```
+
+### The D455 wedge
+
+While debugging the mapping the head camera also returned 503. The tell was
+
+```text
+RuntimeError: xioctl(VIDIOC_S_FMT) failed, errno=5 Last Error: Input/output error
+```
+
+with **no process holding** `/dev/video12`–`17`. That is the firmware, not a
+permission problem. Recover with:
+
+```bash
+.venv-robot/bin/python - <<'PY'
+import pyrealsense2 as rs, time
+for d in rs.context().query_devices():
+    d.hardware_reset()
+    print("reset", d.get_info(rs.camera_info.serial_number))
+time.sleep(8)
+PY
+```
+
+Then restart whatever owned the camera. The reset re-enumerates the whole USB
+bus, so wrist indices move again — which is the reason for §30 in the first
+place.
+
+### Check
+
+```bash
+for p in head left right head_depth; do
+  curl -s -m 8 -o /tmp/opencode/$p.jpg -w "$p %{http_code}\n" \
+    http://127.0.0.1:8080/snapshot/$p
+done
+```
+
+All four must be 200, and `left`/`right` must show the two grippers, not the
+room from the laptop lid.
