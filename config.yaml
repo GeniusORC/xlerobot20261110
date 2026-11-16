@@ -1,0 +1,40 @@
+# XLeRobot hardware configuration — single source of truth for this build.
+# All Python scripts read this file via scripts/config_loader.py.
+# Never commit secrets here; LLM credentials stay in ~/.config/xlerobot/llm.env
+
+robot:
+  wheel_radius_m: 0.0635       # 5-inch wheels; default upstream 0.05 is wrong
+  wheelbase_m: 0.414           # measured 2026-11-10 by 80° turn test (true ~0.41–0.42 m)
+  follow_standoff_m: 1.0       # target person distance in follow mode
+  head_eye_tilt: -63.6         # normalized tilt at eye level (measured 2026-11-16)
+  invert_linear: true          # this build drives backward for positive x; patch inverts only x
+
+cameras:
+  head_serial: "333422300185"  # D455 USB serial
+  head_width: 640
+  head_height: 480
+  head_fps: 30
+  wrist_left_path: "pci-0000:00:14.0-usb-0:1.2:1.0-video-index0"   # USB port 1.2
+  wrist_right_path: "pci-0000:00:14.0-usb-0:2.2:1.0-video-index0"  # USB port 2.2
+  wrist_width: 640
+  wrist_height: 480
+  wrist_fps: 30
+
+motors:
+  # Both buses at 1 Mbaud
+  port_bus1: "/dev/xlerobot_serial_b"   # left arm (IDs 1-6) + head (IDs 7-8)
+  port_bus2: "/dev/xlerobot_serial_a"   # right arm (IDs 1-6) + wheels (IDs 9-10)
+  head_pan_id: 7
+  head_tilt_id: 8
+
+services:
+  robot_api:   "http://127.0.0.1:8090"
+  camera_web:  "http://127.0.0.1:8080"
+  voice_web:   "http://127.0.0.1:8082"
+  health_web:  "http://127.0.0.1:8084"
+  face_web:    "http://127.0.0.1:8086"
+
+logs:
+  dir: "data/logs"             # relative to project root; persistent across reboots
+  max_bytes: 10485760          # 10 MB per log file before rotation
+  backup_count: 3

@@ -24,23 +24,26 @@ try:
 except Exception:
     rs = None
 
-HEAD_D455_SERIAL = "333422300185"
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+from config_loader import CFG as _CFG
 
-# /dev/videoN is enumeration order: on 2026-11-16 the wrist cameras came back
-# as video8/video10 and "right" (video0) was the laptop webcam.  Both wrists
-# are identical Sonix USB2.0_CAM1 units with no serial, so the USB port is the
-# only stable identity.  Port 1.2 is the left arm, 2.2 the right (verified by
-# moving the left arm and watching which image changed).
+HEAD_D455_SERIAL = _CFG["cameras"]["head_serial"]
+
+# Wrist cameras: stable by USB port path.  Values come from config.yaml so a
+# port assignment change is a one-file edit.
 WRIST_PATHS = {
     "left": [
-        "/dev/xlerobot_cam_left",          # optional udev rule
-        "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1.2:1.0-video-index0",
+        "/dev/xlerobot_cam_left",
+        "/dev/v4l/by-path/" + _CFG["cameras"]["wrist_left_path"],
     ],
     "right": [
         "/dev/xlerobot_cam_right",
-        "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.2:1.0-video-index0",
+        "/dev/v4l/by-path/" + _CFG["cameras"]["wrist_right_path"],
     ],
 }
+_D455_RESETS = 3        # hardware-reset attempts before giving up
+_D455_RESET_WAIT = 9.0  # seconds between reset and re-open
 
 
 def wrist_dev(which):
@@ -125,6 +128,7 @@ class RealSenseHead:
         self.error = None
         self.lock = threading.Lock()
         self.stop = False
+        self._fail_count = 0   # consecutive open failures; triggers hw reset
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def start(self):
@@ -177,15 +181,33 @@ class RealSenseHead:
                         with self.lock:
                             self.depth_jpeg = buf.tobytes()
                 self.error = None
+                self._fail_count = 0  # success: reset the counter
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
+                self._fail_count += 1
                 try:
                     if self.pipe is not None:
                         self.pipe.stop()
                 except Exception:
                     pass
                 self.pipe = None
-                time.sleep(1)
+                # After _D455_RESETS consecutive failures, try hardware_reset().
+                if self._fail_count >= _D455_RESETS:
+                    print(f"D455: {self._fail_count} consecutive failures, attempting hardware_reset…", flush=True)
+                    try:
+                        ctx = rs.context()
+                        for dev in ctx.devices:
+                            if dev.get_info(rs.camera_info.serial_number) == self.serial:
+                                dev.hardware_reset()
+                                print("D455: hardware_reset() issued, waiting for re-enumeration…", flush=True)
+                                self._fail_count = 0  # reset after hw reset attempt
+                                time.sleep(_D455_RESET_WAIT)
+                                break
+                    except Exception as reset_err:
+                        print(f"D455: hardware_reset failed: {reset_err}", flush=True)
+                        time.sleep(2)
+                else:
+                    time.sleep(1)
 
     @staticmethod
     def _img(frame):

@@ -24,12 +24,14 @@ from collections import deque
 from datetime import datetime
 
 import numpy as np
+import requests
 import soundfile as sf
 import torch
 from flask import Flask, jsonify, request
 
 import face_client as face
 import voice_web as vw
+from control_page import HTML as CONTROL_HTML
 
 CAPTURE_DEV = os.environ.get("CAPTURE_DEV", "default")
 PLAYBACK_DEV = os.environ.get("PLAYBACK_DEV", "default")
@@ -353,6 +355,70 @@ def api_status():
     return jsonify(st)
 
 
+@app.get("/api/health")
+def api_health():
+    """Check health of all 5 services for the control panel status bar."""
+    out = {}
+    services = [
+        ("robot_api", "http://127.0.0.1:8090/status"),
+        ("camera_web", "http://127.0.0.1:8080/"),
+        ("health_web", "http://127.0.0.1:8084/"),
+        ("face_web", "http://127.0.0.1:8086/state"),
+    ]
+    for name, url in services:
+        try:
+            r = requests.get(url, timeout=1.5)
+            out[name] = {"ok": r.ok, "code": r.status_code}
+        except Exception as e:
+            out[name] = {"ok": False, "error": str(e)[:80]}
+    out["voice_web"] = {"ok": True}  # self
+    return jsonify(out)
+
+
+@app.get("/control")
+def control():
+    return CONTROL_HTML
+
+
+@app.route("/api/robot/<path:sub>", methods=["GET", "POST"])
+def api_robot(sub):
+    """Thin proxy to robot_api (8090).
+
+    The control page is served from 8082, so calling 8090 directly would be a
+    cross-origin request.  Proxying keeps one origin for the browser and keeps
+    robot_api bound to 127.0.0.1.
+    """
+    body = request.get_json(force=True, silent=True) if request.method == "POST" else None
+    try:
+        r = requests.request(request.method, f"{vw.ROBOT_API}/{sub}",
+                             json=body, params=request.args, timeout=20)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 502
+    return (r.content, r.status_code, {"Content-Type": "application/json"})
+
+
+@app.get("/api/logs/<name>")
+def api_logs(name):
+    """Return the last N lines of a log file for the control panel log viewer."""
+    allowed = {"robot_api", "camera_web", "voice_auto", "health_station", "face_display", "head_track", "watchdog"}
+    if name not in allowed:
+        return jsonify({"error": "unknown log"}), 400
+
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
+    path = os.path.join(log_dir, f"{name}.log")
+
+    if not os.path.exists(path):
+        return jsonify({"lines": [], "exists": False})
+
+    try:
+        n = min(int(request.args.get("lines", 50)), 200)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return jsonify({"lines": lines[-n:], "exists": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}, exists=True), 500
+
+
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>XLeRobot 养老陪伴</title>
 <style>
@@ -377,7 +443,8 @@ small{color:#888}
 .camwrap{display:none}.camwrap.on{display:block}
 .camsw{font-size:13px;padding:8px 11px;margin:2px}
 </style></head><body>
-<h1>XLeRobot 养老陪伴 <small>· 自动语音</small></h1>
+<h1>XLeRobot 养老陪伴 <small>· 自动语音</small>
+  <a href="/control" style="font-size:13px;font-weight:400;color:#7ab;margin-left:10px">控制台 →</a></h1>
 <div class="grid">
   <div class="card">
     <button class="stop" onclick="send('stop')">停下</button>
