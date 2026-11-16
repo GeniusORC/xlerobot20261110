@@ -1569,3 +1569,56 @@ done
 
 All four must be 200, and `left`/`right` must show the two grippers, not the
 room from the laptop lid.
+
+### One head controller at a time
+
+The head has three possible drivers and they do not negotiate:
+
+| Driver | When |
+|---|---|
+| `scripts/head_track.py` | companion demo (face tracking + smile mirror) |
+| health page **头部跟随** toggle | gait capture, aim loop, idle framing |
+| `/head` commands | teleop, voice, `test_head.py` |
+
+On 2026-11-16 the health page's toggle had been left on. Its idle loop kept
+pulling the head toward the subject's torso every ~0.5 s, so every manual
+`/head` command was undone within a second — it looked exactly like a broken
+servo: command `dtilt -8`, the head moves 8 units, then drifts back over 1 s.
+
+Symptoms if two controllers run:
+
+```text
+POST /head every ~0.5 s in /tmp/opencode/robot_api.log
+the head returns to a pose you did not command, pan and tilt both
+GET /api/status on 8084 shows "track": true
+```
+
+Turn the health page's toggle off (`POST /api/track {"on": false}`) before
+starting `head_track.py`. The toggle no longer calls `/head {"center": true}`
+when switched off: that ramp goes to the calibration midpoint, which on this
+build points at the table, so switching tracking off used to leave the robot
+staring at the desk.
+
+### The tilt guard
+
+The Haar cascade fires on desk clutter (a phone, a white box, the dark
+monitor), and the metric face-width filter passes some of them. Left alone,
+the tilt loop walked the head down until the camera was staring at the table
+and held it there — the "head camera is not good" symptom.
+
+`head_track.py` now bounds tracking to `REST_SPAN = 25` normalized units
+around the pose the process was **launched** in, and returns the tilt to that
+pose whenever no face is visible. Launch it with the head at eye level
+(`tilt ≈ -63.6` on this build):
+
+```bash
+# with nothing else driving the head:
+curl -X POST localhost:8090/head -H 'Content-Type: application/json' \
+     -d '{"pan":0,"tilt":-63.6}'
+.venv/bin/python scripts/head_track.py            # head only
+.venv/bin/python scripts/head_track.py --follow   # + base (turns the latch on)
+```
+
+On exit (including `pkill`, i.e. SIGTERM) it walks back to the launch pose
+instead of calling `center`, which would redefine "forward" as wherever the
+head happened to be.

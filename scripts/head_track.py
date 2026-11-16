@@ -24,6 +24,7 @@ Run:
 """
 import argparse
 import os
+import signal
 import time
 from collections import deque
 
@@ -43,11 +44,19 @@ DEAD = 0.06          # ignore offsets smaller than 6% of the image
 MAX_STEP = (9.0, 6.0)
 CMD_GAP = 0.18       # servos need time to move before we judge again
 
+# The Haar cascade fires on desk clutter (a phone, a white box) often enough
+# that the tilt loop once walked the head down until the camera was staring at
+# the table, and stayed there.  Tracking may not tilt more than this from the
+# pose the process was launched in; idle returns to it.
+REST_SPAN = 25.0
+
 
 class Head:
     def __init__(self):
         self.pan = 0.0
         self.tilt = 0.0
+        self.rest_pan = None
+        self.rest_tilt = None
         self.fails = 0
         self.last_cmd = 0.0
         self.prev = None
@@ -67,7 +76,31 @@ class Head:
             return False
 
     def center(self):
+        """Ramp to the calibration midpoint and redefine it as 0/0.
+
+        Not used by this process any more: on this build the midpoint points
+        at the table, so restoring to it is worse than leaving the head where
+        it is.  ``restore()`` walks back to the launch pose instead.
+        """
         return self.post({"center": True})
+
+    def restore(self, tries=12):
+        """Walk back to the launch pose.
+
+        Absolute /head moves are clamped to MAX_STEP per request, so this
+        needs a few round trips; it is deliberately slow rather than a jump.
+        """
+        for _ in range(tries):
+            if not self.post({"pan": self.rest_pan, "tilt": self.rest_tilt},
+                             timeout=3.0):
+                return False
+            if not self.sync():
+                return False
+            if (abs(self.pan - self.rest_pan) < 1.0
+                    and abs(self.tilt - self.rest_tilt) < 1.0):
+                return True
+            time.sleep(0.1)
+        return True
 
     def sync(self):
         """Re-read pan/tilt from the server.
@@ -113,6 +146,10 @@ class Head:
         dtilt = 0.0 if abs(ey) < DEAD else -TILT_SIGN * KP[1] * ey
         dpan = float(np.clip(dpan, -MAX_STEP[0], MAX_STEP[0]))
         dtilt = float(np.clip(dtilt, -MAX_STEP[1], MAX_STEP[1]))
+        if self.rest_tilt is not None:
+            lo = self.rest_tilt - REST_SPAN
+            hi = self.rest_tilt + REST_SPAN
+            dtilt = float(np.clip(self.tilt + dtilt, lo, hi) - self.tilt)
         if dpan == 0.0 and dtilt == 0.0:
             return True
         if time.monotonic() - self.last_cmd < CMD_GAP:
@@ -283,7 +320,15 @@ class Follower:
         return (x, theta)
 
 
+def _on_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
+    # pkill sends SIGTERM, which by default skips the finally block that
+    # returns the head to its launch pose.
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-face", action="store_true",
                     help="do not drive the laptop face display")
@@ -299,6 +344,8 @@ def main():
 
     head = Head()
     head.sync()
+    head.rest_pan = head.pan          # launch pose = where idle returns to
+    head.rest_tilt = head.tilt
     follower = Follower(args.standoff) if args.follow else None
     if follower is not None:
         follower.enable()
@@ -352,9 +399,15 @@ def main():
                 idle = time.time() - last_seen
                 if idle > args.search_after and time.time() - search_at > 0.8:
                     search_at = time.time()
-                    ok = head.post({"dpan": 7.0 * search_dir})
+                    payload = {"dpan": 7.0 * search_dir}
+                    if head.rest_tilt is not None:
+                        dtilt = float(np.clip(
+                            (head.rest_tilt - head.tilt) * 0.5, -6.0, 6.0))
+                        payload["dtilt"] = 0.0 if abs(dtilt) < 1.0 else dtilt
+                    ok = head.post(payload)
                     if ok:
                         head.pan += 7.0 * search_dir
+                        head.tilt += payload.get("dtilt", 0.0)
                     if abs(head.pan) > 60:
                         search_dir *= -1.0
 
@@ -371,7 +424,11 @@ def main():
     finally:
         if follower is not None:
             follower.disable()
-        head.center()
+        # Return to the launch pose without calling /head {"center": true}:
+        # center re-references the head wherever it is, which once declared a
+        # desk-staring pose to be "forward".
+        if head.rest_tilt is not None:
+            head.restore()
     return 0
 
 

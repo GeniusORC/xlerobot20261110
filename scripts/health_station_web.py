@@ -1448,11 +1448,11 @@ def api_track():
     on = bool(data.get("on", True))
     set_track(track=on,
               track_message="头部跟随已开启" if on else "头部跟随已关闭")
-    if not on:
-        try:
-            get_tracker().head(center=True)
-        except Exception:
-            pass
+    # Turning tracking off only stops this loop.  It used to call
+    # /head {"center": true}, which ramps the head to the calibration
+    # midpoint -- on this build that points at the table, so switching the
+    # toggle off left the robot staring at the desk and fought head_track.py
+    # for the next few seconds.
     return jsonify({"ok": True, "track": on})
 
 
