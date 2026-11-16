@@ -43,6 +43,48 @@ also in the desktop application menu as **XLeRobot 固定健康站**.
 Set `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (e.g. DeepSeek `deepseek-chat`)
 to use the real LLM; otherwise the local companion fallback is used.
 
+## Companion demo (voice, face, head tracking, follow)
+
+One command brings the whole stack up:
+
+```bash
+./scripts/start_demo.sh     # FOLLOW=0 for head-only tracking
+./scripts/stop_demo.sh
+```
+
+| Service | Port | What it does |
+|---|---|---|
+| `camera_web.py` | 8080 | web page with four live streams (head, left, right, head depth) |
+| `voice_auto_web.py` | 8082 | always-on voice (no push-to-talk), chat, lip-sync |
+| `health_station_web.py` | 8084 | gait capture and reports |
+| `robot_api.py` | 8090 | base / head / arms |
+| `face_display.py` | 8086 | the laptop panel as the robot's face |
+| `head_track.py` | — | turns the head to keep your face centred; `--follow` drives the base too |
+
+The interaction loop is not a keyword bot: one DeepSeek function-calling turn
+decides chat vs. robot action, the head camera contributes one sentence of
+context ("看到一个人，距离约1.1米，在画面中间"), and long-term facts live in
+`data/chat/chat.db` (`facts` table).
+
+Safety is enforced in code, not in the prompt:
+
+- emergency/crisis phrases never reach the model; `停下` is a hard keyword stop;
+- misfired movement tool calls on sentences without motion words are re-asked
+  with tools disabled;
+- base following needs an explicit latch (`POST /follow`), `stop`/`estop`
+  revoke it, and `/velocity` returns 409 without it — a voice stop cannot be
+  overridden by the follow loop 100 ms later;
+- follow holds 1 m, never drives forward below 0.85 m, backs off below 0.55 m.
+
+Voice commands: `往前走三十厘米`, `左转九十度`, `过来`, `看我`, `停下`,
+`跟着我`, `别跟着我了`.
+
+Barge-in works because PipeWire software echo cancellation removes the robot's
+own TTS from the microphone (~34 dB measured), so the VAD can keep listening
+while it speaks.
+
+Details: `docs/setup.md` sections 26–29.
+
 ## Quick checks
 
 ```bash
