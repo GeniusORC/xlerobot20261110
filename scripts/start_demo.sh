@@ -16,6 +16,11 @@ cd "$(dirname "$0")/.."
 LOG=${LOG:-/tmp/opencode}
 mkdir -p "$LOG"
 
+# FOLLOW=0 disables base following (head tracking still runs).
+FOLLOW=${FOLLOW:-1}
+HT_ARGS=""
+[ "$FOLLOW" = "1" ] && HT_ARGS="--follow"
+
 export DISPLAY="${DISPLAY:-:1}"
 export XAUTHORITY="${XAUTHORITY:-/run/user/1000/gdm/Xauthority}"
 
@@ -37,7 +42,7 @@ launch robot_api.py "source scripts/env.sh robot && exec python scripts/robot_ap
 launch health_station_web.py "exec .venv/bin/python scripts/health_station_web.py --port 8084"
 launch voice_auto_web.py "source scripts/env.sh voice && exec python scripts/voice_auto_web.py --port 8082"
 launch face_display.py "exec .venv/bin/python scripts/face_display.py --monitor 1"
-launch head_track.py "exec .venv/bin/python scripts/head_track.py"
+launch head_track.py "exec .venv/bin/python scripts/head_track.py $HT_ARGS"
 
 sleep 6
 echo
@@ -47,4 +52,9 @@ echo "  health  http://127.0.0.1:8084/"
 echo "  face    http://127.0.0.1:8086/state"
 echo
 echo "  robot_api:  curl -s localhost:8090/status"
+if [ "$FOLLOW" = "1" ]; then
+  echo "  following:  on (1.0 m standoff; say 跟着我 / 别跟着我了 to switch)"
+else
+  echo "  following:  off (start again with FOLLOW=1 to enable)"
+fi
 echo "  stop all:   ./scripts/stop_demo.sh"

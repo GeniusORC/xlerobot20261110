@@ -46,6 +46,20 @@ ASR = None
 CHAT_HISTORY = []
 MAX_HISTORY = 12
 
+# Ending follow is handled in code, like "停下": a chat answer would leave the
+# base following while the robot claims it stopped.
+FOLLOW_OFF_WORDS = ("别跟着", "不要跟着", "不用跟着", "别跟了", "不用跟了",
+                    "不要跟了", "别再跟")
+
+# Short imperative forms only.  "我孙子跟着我去公园" must stay chat, so a
+# follow command has to be a short sentence, not merely contain the words.
+FOLLOW_ON_WORDS = ("跟着我", "跟我走", "跟我来", "跟上我", "跟着我走")
+
+
+def wants_follow(text: str) -> bool:
+    t = (text or "").strip().strip("。！!，,. ")
+    return len(t) <= 8 and any(w in t for w in FOLLOW_ON_WORDS)
+
 EMERGENCY_WORDS = (
     "胸痛", "胸口疼", "呼吸困难", "喘不过", "说不出话", "嘴歪", "半身",
     "跌倒", "摔倒", "救命", "晕倒", "意识不清", "大出血",
@@ -114,6 +128,18 @@ def robot_status() -> dict:
         return r.json()
     except Exception as e:
         return {"connected": False, "error": str(e)}
+
+
+def robot_follow(on: bool = True) -> dict:
+    """Turn base following on or off (needs head_track.py --follow running)."""
+    try:
+        r = requests.post(f"{ROBOT_API}/follow", json={"on": bool(on)}, timeout=5)
+        if r.status_code == 503:
+            return {"error": "robot not connected"}
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": f"robot API: {type(e).__name__}: {e}"}
 
 
 def robot_move(forward_m: float = 0.0, turn_deg: float = 0.0) -> dict:
@@ -280,12 +306,29 @@ def handle_action(decision: dict, text: str = "") -> dict:
             reply = reply or "我在线，底盘已经停稳。"
         else:
             reply = "机器人还没连上，请检查电源和串口。"
+    elif action == "follow_me":
+        on = bool(args.get("on", True))
+        result = robot_follow(on)
+        if not result.get("error") and on:
+            # The latch is not the same thing as a follower: head_track.py has
+            # to be running for the base to move.  It re-reads the latch every
+            # second, so give it a moment before deciding what to say.
+            time.sleep(1.3)
+            if not robot_status().get("follow_client"):
+                result = {"error": "no follower"}
+        if not result.get("error"):
+            reply = reply or ("好的，我跟着您，保持一米左右。" if on
+                              else "好，我不跟了。")
     else:
         result = {"error": f"unknown action {action}"}
 
     if not reply:
         reply = agent_brain.ACTION_REPLY.get(action, "好的。")
-    if isinstance(result, dict) and result.get("error") \
+    if isinstance(result, dict) and result.get("error") == "no follower":
+        # The latch is on but head_track is not running, so the base will not
+        # move.  Say so instead of promising to follow.
+        reply = "跟人的程序还没开，我先把这边准备好；把跟人程序打开我就能跟着您走。"
+    elif isinstance(result, dict) and result.get("error") \
             and result.get("error") != "no distance or angle":
         # Never claim an action succeeded when the robot API did not take it.
         reply = "我这边连不上机器人，请检查电源和串口。"
@@ -314,6 +357,27 @@ def route_text(text: str) -> dict:
         return {**handle_intent("stop", text), "mode": "command",
                 "engine": "keyword"}
 
+    # Same for ending follow: "别跟着我了" answered as chat would leave the
+    # base following while the robot says it stopped, so revoke the latch in
+    # code instead of trusting the tool call.
+    if any(w in text for w in FOLLOW_OFF_WORDS):
+        result = robot_follow(False)
+        reply = "好，我不跟了。"
+        if isinstance(result, dict) and result.get("error"):
+            reply = "我这边连不上机器人，请检查电源和串口。"
+        _push_history(text, reply)
+        return {"text": text, "intent": "follow_me", "reply": reply,
+                "engine": "keyword", "robot": result,
+                "audio": speech_file(reply), "mode": "command"}
+
+    # "跟着我" is short and imperative: start following without waiting for a
+    # model turn, and let handle_action check that a follower is really running.
+    if wants_follow(text):
+        out = handle_action({"action": "follow_me", "args": {"on": True},
+                             "reply": "", "engine": "keyword"}, text)
+        out["engine"] = "keyword"
+        return out
+
     # One function-calling turn decides chat vs. robot action, with a one-line
     # summary of what the head camera sees.
     vision = vision_context.describe()
@@ -330,7 +394,7 @@ def route_text(text: str) -> dict:
                 "mode": "chat"}
 
     action = decision["action"]
-    if action in ("move_robot", "come_here", "look_at_me") \
+    if action in ("move_robot", "come_here", "look_at_me", "follow_me") \
             and not agent_brain.has_motion_words(text):
         # The model sometimes latches onto an earlier robot turn and calls a
         # movement tool while the user is just talking.  Re-ask without tools.

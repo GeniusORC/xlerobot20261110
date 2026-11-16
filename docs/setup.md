@@ -1363,3 +1363,106 @@ the loop walked the face to x=290 (centre) in about 3 s and then held it with
 Base following is deliberately **not** part of `head_track.py`: driving while
 someone is talking to the robot needs the health station's distance safety
 (0.85 m minimum, hard stop 0.60 m), so it stays in that code path.
+
+## 29. Base following (`--follow`)
+
+The head tracker can also drive the base, so the robot follows you around and
+keeps its head on you at the same time:
+
+```bash
+.venv/bin/python scripts/head_track.py --follow               # hold 1.0 m
+.venv/bin/python scripts/head_track.py --follow --standoff 1.2
+.venv/bin/python scripts/head_track.py --follow --verbose     # print the loop
+```
+
+`scripts/start_demo.sh` starts it with `--follow` by default; use
+`FOLLOW=0 ./scripts/start_demo.sh` for head-only tracking.
+
+### Two loops that cannot fight
+
+| Loop | Input | Output | Gain |
+|---|---|---|---|
+| distance | face depth (median of 5, jump gate 0.70 m) | forward speed | 0.35, clamped ±0.26 / −0.16 m/s |
+| turning | **head pan** | base theta | 0.55, clamped ±12 deg/s |
+
+Turning is driven by the head angle, not by the pixel offset: the head keeps
+the face centred for small movements and the base only turns once the head has
+used 42 of its 98 units of travel. Two controllers on the same pixel error
+would otherwise push against each other.
+
+The base does **not** turn while the head is sweeping to look for you — `pan`
+is then a search position, not an error, and turning on it spun the robot
+around the room during the first test. `update(..., seen=False)` holds theta
+at zero.
+
+### Distance safety (enforced in code, not in the prompt)
+
+| Rule | Value | Why |
+|---|---|---|
+| never drive forward below | 0.85 m | cannot walk into the person |
+| back off | below 0.55 m for 0.6 s | being walked into, not someone leaning in |
+| deadband | 0.15 m | no hunting around the setpoint |
+| max forward / back | 0.26 / 0.16 m/s | slower than walking |
+| depth jump gate | 0.70 m in one frame | a different bright box is not the person |
+| person lost | x = 0, theta = 0 | never creep forward blind |
+
+### The follow latch, and why it exists
+
+`/velocity` has a 0.6 s lease, which stops the base if the client dies. That is
+not enough for a *live* client: a voice "停下" would be overridden 100 ms later
+by the next control step. So `robot_api` has an explicit follow mode:
+
+```
+POST /follow {"on": true|false}      # required by /velocity
+POST /follow/heartbeat               # client liveness, once a second
+```
+
+* `/velocity` returns **409** unless follow mode is on;
+* `/command {"intent":"stop"}` and `/estop` switch follow mode **off**;
+* `/status` reports `follow` (the latch) and `follow_client` (a heartbeat in
+  the last 3 s), so the voice side can tell "follow is on" from "something is
+  actually following".
+
+`head_track.py` re-reads the latch every second, so a stop pauses it and a
+later "跟着我" resumes it without restarting the process.
+
+### Voice control
+
+| You say | What happens |
+|---|---|
+| 跟着我 / 跟我走 / 跟着我走 | follow mode on, replies "好的，我跟着您，保持一米左右。" |
+| 别跟着我了 / 不用跟了 | follow mode off, replies "好，我不跟了。" |
+| 停下 | stop command, which also revokes follow mode |
+
+Both directions are handled **in code** (`FOLLOW_ON_WORDS` / `FOLLOW_OFF_WORDS`
+in `voice_web.py`), not left to the model, for the same reason "停下" is:
+
+* a chat answer to "别跟着我了" left the base following while the robot said
+  it had stopped — a false claim about motion;
+* a chat answer to "跟着我" said "好，跟上了" with the latch still off.
+
+The on-rule only fires for **short** sentences (≤ 8 characters), so "我孙子跟着我去公园"
+stays a chat turn.
+
+If follow mode is on but no follower is heartbeating (head_track not running),
+the reply says so instead of promising to follow.
+
+### Measured on 2026-11-16
+
+* distance loop unit test: `d=2.00 → +0.260 m/s`, `1.20 → +0.070`,
+  `1.10/1.00/0.90 → 0`, `0.80 → −0.070`, `0.60 → −0.140`;
+* turn cascade: `pan ±43 → ∓0.55 deg/s`, `pan ±98 → ∓12.0 deg/s`, dead inside ±42;
+* back-off debounce: 0.6 s at zero before reversing;
+* live run with the person at 0.59 m: `x=-0.14 m/s` until 0.66 m, then a voice
+  stop paused follow (`head_track: follow paused by a stop command`);
+* `/velocity` without follow → 409; after `/command stop` → 409 again.
+
+### Limitations
+
+* no rear sensor: backing off can reverse into something behind the robot, so
+  keep 0.5 m clear behind it;
+* following needs the face visible — if you turn away it holds still rather
+  than guessing;
+* depth comes from the face, so a very close face (< 0.4 m) is unreliable;
+* the base is two-wheel differential with no odometry in this loop: distance is
+  closed on the camera, not on wheel counts.

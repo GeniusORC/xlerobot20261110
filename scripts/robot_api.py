@@ -11,6 +11,7 @@ Endpoints:
   GET  /head                        head pan/tilt (normalized -100..100)
   POST /head      {"pan":..,"tilt":..} or {"dpan":..,"dtilt":..} or {"center":true}
   POST /drive     {"x":m/s,"theta":deg/s,"duration":s}  bounded fine positioning
+  POST /follow    {"on":true|false}  enable/revoke follow mode (required by /velocity)
   POST /velocity  {"x":..,"theta":..} short-lease continuous following
   POST /estop
 """
@@ -36,6 +37,7 @@ STATE = {
     "message": "starting",
     "x_vel": 0.0,
     "theta_vel": 0.0,
+    "follow": False,
     "updated": time.time(),
 }
 STATE_LOCK = threading.Lock()
@@ -66,6 +68,13 @@ HEAD_REF = {"pan": None, "tilt": None}
 # a person is slower than retreating from one.
 VEL = {"x": 0.0, "theta": 0.0, "lease": 0.0}
 VEL_LIMIT = (-0.22, 0.30)   # forward raised so a normal walk can be followed
+
+# Following is an explicit mode, not just a stream of velocity commands.  The
+# 0.6 s lease already stops the base if the client dies; this latch stops it
+# when a *live* client is overridden by a human: /command stop, /estop and the
+# voice "停下" all switch it off, so the follow loop cannot immediately resume
+# driving after the user asked it to stop.
+FOLLOW = {"on": False, "seen": 0.0}
 
 
 def set_state(**kwargs):
@@ -205,7 +214,7 @@ def _apply_velocity():
     """Apply the leased velocity, or stop when it expires. True if applied."""
     if not VEL["lease"]:
         return False
-    if STOP_EVENT.is_set() or time.time() > VEL["lease"]:
+    if not FOLLOW["on"] or STOP_EVENT.is_set() or time.time() > VEL["lease"]:
         VEL["lease"] = 0.0
         try:
             ROBOT.stop_base()
@@ -387,7 +396,12 @@ def worker():
 
 @app.get("/status")
 def status():
-    return jsonify(get_state())
+    out = get_state()
+    # Whether a follow client (head_track --follow) is actually talking to us.
+    # The latch alone is not enough: the voice reply must not promise to
+    # follow when nothing is driving.
+    out["follow_client"] = (time.time() - FOLLOW["seen"]) < 3.0
+    return jsonify(out)
 
 
 @app.post("/command")
@@ -400,6 +414,10 @@ def command():
         return jsonify({"error": "robot not connected", **get_state()}), 503
     if intent == "stop":
         STOP_EVENT.set()
+        # A human stop also ends follow mode; otherwise the follow loop would
+        # refresh the velocity lease 100 ms later and drive on.
+        FOLLOW["on"] = False
+        set_state(follow=False)
     COMMANDS.put(intent)
     return jsonify({"queued": intent, **get_state()})
 
@@ -487,6 +505,11 @@ def velocity():
         VEL["x"] = VEL["theta"] = 0.0
         COMMANDS.put("stop")
         return jsonify({"ok": True, "stopped": True})
+    if not FOLLOW["on"]:
+        # 409, not 403: the client is allowed to ask, it just has to enable
+        # follow mode first (which a stop command revokes).
+        return jsonify({"error": "follow is off", "follow": False}), 409
+    FOLLOW["seen"] = time.time()
     x = float(np.clip(float(data.get("x", 0.0)), *VEL_LIMIT))
     theta = float(np.clip(float(data.get("theta", 0.0)), -25.0, 25.0))
     STOP_EVENT.clear()
@@ -495,9 +518,50 @@ def velocity():
                     "lease_ms": 600})
 
 
+@app.post("/follow")
+def follow():
+    """Enable or revoke follow mode.
+
+    Follow mode is what /velocity requires.  It is revoked by /estop and by the
+    "stop" command, so the user always has the last word even while a follow
+    loop is running.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    on = bool(data.get("on", True))
+    if on and (ROBOT is None or not get_state().get("connected")):
+        return jsonify({"error": "robot not connected", **get_state()}), 503
+    FOLLOW["on"] = on
+    if on:
+        STOP_EVENT.clear()
+    else:
+        VEL["lease"] = 0.0
+        VEL["x"] = VEL["theta"] = 0.0
+        if ROBOT is not None:
+            try:
+                ROBOT.stop_base()
+            except Exception:
+                pass
+    set_state(follow=on, message="跟人模式已开启" if on else "跟人模式已关闭")
+    return jsonify({"ok": True, "follow": on})
+
+
+@app.post("/follow/heartbeat")
+def follow_heartbeat():
+    """Called once a second by the follow client (head_track.py).
+
+    This is what makes "follow is on" different from "something is actually
+    following": /status reports ``follow_client`` from this timestamp, so the
+    voice side can refuse to promise to follow when no client is running.
+    """
+    FOLLOW["seen"] = time.time()
+    return jsonify({"ok": True, "follow": FOLLOW["on"]})
+
+
 @app.post("/estop")
 def estop():
     STOP_EVENT.set()
+    FOLLOW["on"] = False
+    set_state(follow=False)
     VEL["lease"] = 0.0
     VEL["x"] = VEL["theta"] = 0.0
     if ROBOT is not None:

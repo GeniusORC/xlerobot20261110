@@ -95,6 +95,26 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "follow_me",
+            "description": (
+                "开启或关闭底盘跟人模式。用户说跟着我、跟着我走、别跟着我了、"
+                "不用跟了时调用。开启后会保持约一米距离跟着用户，"
+                "并且一直转头看着用户。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "on": {
+                        "type": "boolean",
+                        "description": "true 开始跟随，false 停止跟随。默认 true。",
+                    }
+                },
+            },
+        },
+    },
 ]
 
 ACTION_REPLY = {
@@ -102,6 +122,7 @@ ACTION_REPLY = {
     "come_here": "我过来了，您别动。",
     "look_at_me": "我看着您呢。",
     "report_status": "我看看自己的状态。",
+    "follow_me": "好的，我跟着您。",
 }
 
 
@@ -174,7 +195,7 @@ def system_prompt() -> str:
         "3. 下面是你记得的事实，用得上就用，别重复问已经知道的事。\n"
         "4. 用户要机器人动，就调用工具；只是聊天不要调用工具。"
         "用户在说身体不舒服、心情、家常、往事时，绝对不要调用移动工具。"
-        "只有用户明确要求前进、后退、转向、停下、过来或看你时才调用工具，"
+        "只有用户明确要求前进、后退、转向、停下、过来、看你或跟着你时才调用工具，"
         "即使你不确定机器人是否在线也要调用，不要只用文字敷衍。\n"
         "5. 口语化，一般 2-3 句，不超过 120 个汉字。\n"
         "6. 不做医学诊断、不开药。遇到胸痛、呼吸困难、跌倒、意识不清，"
@@ -234,7 +255,7 @@ def build_messages(text: str, history=None, context=None) -> list:
 # Used to sanity-check a tool call: a move/come/look decision on a sentence
 # with none of these words is a model misfire and is re-asked as plain chat.
 MOTION_WORDS = ("前", "后", "左", "右", "转", "走", "动", "停", "退",
-                "过来", "靠近", "面向", "看我", "让开", "别动")
+                "过来", "靠近", "面向", "看我", "让开", "别动", "跟", "陪")
 
 
 def has_motion_words(text: str) -> bool:
