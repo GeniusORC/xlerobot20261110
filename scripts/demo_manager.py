@@ -17,17 +17,23 @@ from config_loader import CFG, project_path
 ROOT = Path(__file__).resolve().parent.parent
 RUN = ROOT / "data" / "run"
 STOP = threading.Event()
+RELAUNCH = threading.Event()
 
 
 def commands():
     robot = str(ROOT / ".venv-robot/bin/python")
     voice = str(ROOT / ".venv/bin/python")
+    face = CFG.get("face") or {}
+    face_cmd = [voice, "scripts/face_display.py",
+                "--monitor", str(face.get("monitor", 1))]
+    if not face.get("close_button", True):
+        face_cmd.append("--no-close-button")
     cmds = {
         "camera_web": [robot, "scripts/camera_web.py", "--port", "8080"],
         "robot_api": [robot, "scripts/robot_api.py", "--port", "8090"],
         "health_station_web": [voice, "scripts/health_station_web.py", "--port", "8084"],
         "voice_auto_web": [voice, "scripts/voice_auto_web.py", "--port", "8082"],
-        "face_display": [voice, "scripts/face_display.py", "--monitor", "1"],
+        "face_display": face_cmd,
         "head_track": [voice, "scripts/head_track.py"],
     }
     if os.environ.get("FOLLOW", "0") == "1":
@@ -65,6 +71,9 @@ def supervise():
         pidfile.write_text(str(os.getpid()))
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: STOP.set())
+        # SIGHUP brings a deliberately closed face back without restarting
+        # the rest of the stack.
+        signal.signal(signal.SIGHUP, lambda *_: RELAUNCH.set())
         children, readers, retry_at, failures = {}, [], {}, {}
         log = logger("watchdog")
         cmds = commands()
@@ -76,6 +85,12 @@ def supervise():
         logs = {name: logger(name) for name in cmds}
         try:
             while not STOP.is_set():
+                if RELAUNCH.is_set():
+                    RELAUNCH.clear()
+                    if "face_display" in cmds:
+                        failures.pop("face_display", None)
+                        retry_at["face_display"] = 0.0
+                        log.info("relaunch requested for face_display")
                 for name, command in cmds.items():
                     proc = children.get(name)
                     if proc and proc.poll() is not None:

@@ -270,7 +270,7 @@ class FaceWindow:
         self.cv.bind("<Button-1>", self._on_click)
         self.cv.bind("<Motion>", self._on_motion)
         self.cv.bind("<Configure>", self._resize)
-        self.root.bind("<Escape>", lambda e: self.close())
+        self.root.bind("<Escape>", lambda e: self.close("Escape key"))
         self.root.after(200, self.tick)
 
     def _layout_close(self):
@@ -294,11 +294,11 @@ class FaceWindow:
 
     def _on_click(self, ev):
         if self.close_enabled and self._in_close(ev):
-            self.close()
+            self.close(f"close button at {ev.x},{ev.y}")
 
-    def close(self):
+    def close(self, reason="api"):
         """Close deliberately: exit 0 so the supervisor leaves the face closed."""
-        print("face display closing", flush=True)
+        print(f"face display closing ({reason})", flush=True)
         try:
             self.root.destroy()
         except Exception:
@@ -398,10 +398,16 @@ class FaceWindow:
 
 
 def main():
+    try:
+        from config_loader import CFG
+    except Exception:          # standalone use outside the project tree
+        CFG = {}
+    face_cfg = (CFG.get("face") or {}) if isinstance(CFG, dict) else {}
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8086)
-    ap.add_argument("--monitor", type=int, default=1,
-                    help="1-based monitor index from xrandr")
+    ap.add_argument("--monitor", type=int, default=int(face_cfg.get("monitor", 1)),
+                    help="1-based monitor index from xrandr (1 = laptop, 2 = external)")
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--debug", action="store_true",
                     help="show the emotion name on screen")
@@ -418,6 +424,9 @@ def main():
     mons = list_monitors()
     geo = None
     if mons and not args.windowed:
+        if args.monitor > len(mons):
+            print(f"monitor {args.monitor} requested but only {len(mons)} "
+                  f"connected; using {len(mons)}", flush=True)
         idx = max(1, min(len(mons), args.monitor)) - 1
         geo = mons[idx]
 
@@ -439,7 +448,8 @@ def main():
         root.geometry("1200x800")
         w, h = 1200, 800
     FaceWindow(root, w, h, debug=args.debug,
-               close_button=not args.no_close_button)
+               close_button=bool(face_cfg.get("close_button", True))
+               and not args.no_close_button)
     print(f"face on {geo or 'window'} | http://127.0.0.1:{args.port}", flush=True)
     root.mainloop()
     return 0

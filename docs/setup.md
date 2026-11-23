@@ -1326,12 +1326,14 @@ reported "已停稳", and the voice path "往前走十厘米" drove the base thr
 | `voice_auto_web.py` | 8082 | always-on voice, chat, face lip-sync |
 | `health_station_web.py` | 8084 | gait capture and reports |
 | `robot_api.py` | 8090 | base / head / arms |
-| `face_display.py` | 8086 | the laptop screen as a face, full screen |
+| `face_display.py` | 8086 | a full-screen face on the monitor chosen by `face.monitor` |
 | `head_track.py` | — | turns the head to keep your face centred |
 
-Open `http://127.0.0.1:8080/` in a browser to watch the video.  Use the second
-monitor (DP-1) for the browser, because `face_display.py` owns the laptop
-panel in full screen.
+Open `http://127.0.0.1:8080/` in a browser to watch the video.  By default the
+face owns the laptop panel (`face.monitor: 1`), so use the second monitor
+(DP-1) for the browser.  To put the face on the external monitor instead, set
+`face.monitor: 2` in `config.yaml` and restart the stack; check the numbering
+with `.venv/bin/python scripts/face_display.py --list-monitors`.
 
 ### Head tracking
 
