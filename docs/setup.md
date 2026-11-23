@@ -304,11 +304,19 @@ L_actual = wheel_arc_difference / actual_body_angle_rad
 The D455 replaced the old head camera. The three robot cameras are configured in
 `config_xlerobot_2wheels.py` (patch `0002-configure-rgb-cameras.patch`):
 
-| Name | Device | Resolution | Notes |
+| Name | Stable identity (do **not** hardcode `/dev/videoN`) | Resolution | Notes |
 |---|---|---|---|
-| `left_wrist` | `/dev/video2` | 640x480@30 | left wrist |
-| `right_wrist` | `/dev/video0` | 640x480@30 | right wrist |
+| `left_wrist` | `/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1.2:1.0-video-index0` | 640x480@30 | left wrist, USB port 1.2 |
+| `right_wrist` | `/dev/v4l/by-path/pci-0000:00:14.0-usb-0:2.2:1.0-video-index0` | 640x480@30 | right wrist, USB port 2.2 |
 | `head` | D455 serial `333422300185` | 640x480@30 | RealSense SDK, color + depth |
+
+The raw `/dev/videoN` numbers are enumeration order and change on every re-plug
+or reboot (observed: left wrist on `video6`, right wrist on `video8`, while
+`video0`/`video2` are D455 nodes). All code therefore addresses the wrists by
+physical USB-port symlink and the head by RealSense serial; there is no
+`/dev/videoN` fallback, because a silently wrong camera is worse than a visible
+error. Optionally install `scripts/udev/99-xlerobot-cameras.rules` to also get
+the short aliases `/dev/xlerobot_cam_left` and `/dev/xlerobot_cam_right`.
 
 Verify all three simultaneously:
 
@@ -321,14 +329,18 @@ Verified: all three open together, `get_observation()` returns
 `left_wrist`, `right_wrist`, `head` as `(480, 640, 3) uint8`, and 20 rounds of
 three frames take ~0.75 s (~26.5 rounds/s total).
 
-Device nodes shifted after the D455 replacement: the left wrist is now
-`/dev/video2`, the right wrist is `/dev/video0`, and the D455 is accessed through
-the RealSense SDK rather than a `/dev/video*` node.
+Device nodes shift whenever a camera is re-plugged or the machine reboots, so
+the current raw numbers must not be relied upon. At the time of writing the left
+wrist enumerates as `/dev/video6` and the right wrist as `/dev/video8`, while
+`/dev/video0` and `/dev/video2` are D455 nodes (which explains why an earlier
+note mislabeled the right wrist as `/dev/video2`). The software ignores these
+numbers and opens the wrists through their USB-port `by-path` symlinks and the
+head through the RealSense serial.
 
-Measured with `scripts/test_cameras.py`:
+Measured with `scripts/test_cameras.py` (raw nodes shown only for that session):
 
-- left wrist `/dev/video2`: sharpness ~152
-- right wrist `/dev/video0`: sharpness ~69
+- left wrist, USB 1.2 (`/dev/video6` at the time): sharpness ~152
+- right wrist, USB 2.2 (`/dev/video8` at the time): sharpness ~69
 - D455 head: sharpness ~825, color `(480,640,3)`, aligned depth
   `(480,640,1) uint16` (max ~7.4 m)
 - three-camera round: ~26.9 rounds/s

@@ -15,7 +15,13 @@ import numpy as np
 
 from lerobot_robot_xlerobot_2wheels import XLerobot2Wheels, XLerobot2WheelsConfig
 
-DEVICES = {"a(1.2)": "/dev/video8", "b(2.2)": "/dev/video10"}
+# Resolve wrists by stable USB-port symlink, not a raw /dev/videoN that shifts
+# on re-plug. Same source of truth as camera_web.py (config.yaml).
+_BY_PATH = "/dev/v4l/by-path/"
+DEVICES = {
+    "a(1.2)": _BY_PATH + CFG["cameras"]["wrist_left_path"],
+    "b(2.2)": _BY_PATH + CFG["cameras"]["wrist_right_path"],
+}
 
 
 def grab(dev, n=8):

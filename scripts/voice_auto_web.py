@@ -319,7 +319,10 @@ def listen_loop():
 
 @app.get("/")
 def index():
-    return HTML
+    return (HTML
+            .replace("__CAM_HEAD__", vw.CAM_LABELS["head"])
+            .replace("__CAM_LEFT__", vw.CAM_LABELS["left"])
+            .replace("__CAM_RIGHT__", vw.CAM_LABELS["right"]))
 
 
 @app.get("/api/messages")
@@ -582,9 +585,9 @@ label input{width:100%;box-sizing:border-box}
       <button class="camsw" onclick="showCam('right')">右腕</button>
       <button class="camsw" onclick="showCam('all')">三路</button>
     </div>
-    <div id="wrap_head" class="camwrap"><img id="cam_head" src=""><small>head /dev/video0</small></div>
-    <div id="wrap_left" class="camwrap"><img id="cam_left" src=""><small>left /dev/video6</small></div>
-    <div id="wrap_right" class="camwrap"><img id="cam_right" src=""><small>right /dev/video2</small></div>
+    <div id="wrap_head" class="camwrap"><img id="cam_head" src=""><small>head · __CAM_HEAD__</small></div>
+    <div id="wrap_left" class="camwrap"><img id="cam_left" src=""><small>__CAM_LEFT__</small></div>
+    <div id="wrap_right" class="camwrap"><img id="cam_right" src=""><small>__CAM_RIGHT__</small></div>
   </div>
 </div>
 <script>

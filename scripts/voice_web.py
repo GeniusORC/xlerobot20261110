@@ -18,6 +18,7 @@ Without these variables it falls back to a local rule-based companion.
 import argparse
 import os
 import random
+import re
 import subprocess
 import tempfile
 import time
@@ -32,7 +33,7 @@ import agent_brain
 import face_client as face
 import vision_context
 from voice_loop import tts, transcribe, vad_trim
-from config_loader import service_url
+from config_loader import CFG, service_url
 
 ROBOT_API = service_url("robot_api")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -424,7 +425,10 @@ def route_text(text: str) -> dict:
 
 @app.get("/")
 def index():
-    return HTML
+    return (HTML
+            .replace("__CAM_HEAD__", CAM_LABELS["head"])
+            .replace("__CAM_LEFT__", CAM_LABELS["left"])
+            .replace("__CAM_RIGHT__", CAM_LABELS["right"]))
 
 
 @app.post("/api/chat")
@@ -485,6 +489,24 @@ def audio(name):
     return send_from_directory(AUDIO_DIR, name)
 
 
+def _usb_port(by_path: str) -> str:
+    """Reduce a v4l by-path string to its stable USB port, e.g.
+    'pci-...-usb-0:2.2:1.0-video-index0' -> 'USB 2.2'. Falls back to the raw
+    value so a config change never breaks the page."""
+    m = re.search(r"usb-[0-9v.]*-?0:([0-9.]+):", by_path or "")
+    return f"USB {m.group(1)}" if m else (by_path or "?")
+
+
+# Human-facing camera identity. Deliberately NOT /dev/videoN: those numbers are
+# assigned in enumeration order and shift on every re-plug. The head is a D455
+# addressed by serial and the wrists by physical USB port (config.yaml).
+CAM_LABELS = {
+    "head": f"D455 serial {CFG['cameras']['head_serial']}",
+    "left": f"left wrist · {_usb_port(CFG['cameras']['wrist_left_path'])}",
+    "right": f"right wrist · {_usb_port(CFG['cameras']['wrist_right_path'])}",
+}
+
+
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>XLeRobot 养老陪伴</title>
 <style>
@@ -540,9 +562,9 @@ small{color:#888}
       <button class="camsw" onclick="showCam('right')">右腕</button>
       <button class="camsw" onclick="showCam('all')">三路</button>
     </div>
-    <div id="wrap_head" class="camwrap"><img id="cam_head" src=""><small>head /dev/video0</small></div>
-    <div id="wrap_left" class="camwrap"><img id="cam_left" src=""><small>left /dev/video6</small></div>
-    <div id="wrap_right" class="camwrap"><img id="cam_right" src=""><small>right /dev/video2</small></div>
+    <div id="wrap_head" class="camwrap"><img id="cam_head" src=""><small>head · __CAM_HEAD__</small></div>
+    <div id="wrap_left" class="camwrap"><img id="cam_left" src=""><small>__CAM_LEFT__</small></div>
+    <div id="wrap_right" class="camwrap"><img id="cam_right" src=""><small>__CAM_RIGHT__</small></div>
   </div>
 </div>
 <script>
