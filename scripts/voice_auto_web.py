@@ -367,6 +367,36 @@ def api_listen():
     return jsonify({"listening": enabled})
 
 
+@app.get("/api/track")
+def api_track_status():
+    """Face/head tracker state (process managed by track_manager)."""
+    return jsonify(vw.track_manager.status())
+
+
+@app.post("/api/track")
+def api_track_set():
+    """Start/stop face head-tracking.
+
+    Body: {"on": true, "mode": "head"|"follow", "standoff": 1.0}.
+    "head" only pans/tilts the head; "follow" also lets the base trail the
+    person. This runs head_track.py at runtime; a voice "停下" still revokes
+    base follow inside robot_api and stops the tracker via route_text.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    on = bool(data.get("on", True))
+    if not on:
+        ok, payload = vw.track_manager.stop()
+        return jsonify({"ok": ok, **payload}), (200 if ok else 502)
+    mode = str(data.get("mode", "head")).strip().lower()
+    if mode not in vw.track_manager.MODES:
+        return jsonify({"ok": False,
+                        "error": f"mode must be one of {vw.track_manager.MODES}"}), 400
+    ok, payload = vw.track_manager.start(mode, standoff=data.get("standoff"))
+    if not ok:
+        return jsonify({"ok": False, **payload}), 503
+    return jsonify({"ok": True, **payload})
+
+
 @app.get("/api/status")
 def api_status():
     st = vw.robot_status()
@@ -508,6 +538,7 @@ h1{font-size:22px;margin:0 0 14px}
 .card{background:#1d1d1f;border-radius:12px;padding:16px}
 button{font-size:16px;padding:12px 16px;margin:4px;border:0;border-radius:10px;cursor:pointer}
 .stop{background:#d33;color:#fff}.come{background:#2a8;color:#fff}.report{background:#36c;color:#fff}
+.track{background:#5a4a8a;color:#fff}.track.on{background:#2a8;color:#04231a;font-weight:600}
 button:disabled{opacity:.5;cursor:default}
 #chat{height:390px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:4px}
 .msg{max-width:85%;padding:9px 12px;border-radius:12px;line-height:1.45;white-space:pre-wrap}
@@ -541,6 +572,12 @@ label input{width:100%;box-sizing:border-box}
     <button onclick="send('turn_left')">左转</button>
     <button onclick="send('turn_right')">右转</button>
     <button onclick="send('look')">看我</button>
+    <div class="row" style="margin-top:8px;align-items:center">
+      <button class="track" id="trackHeadBtn" onclick="setTrack('head')">头部跟随</button>
+      <button class="track" id="trackFollowBtn" onclick="setTrack('follow')">头部+底盘</button>
+      <button class="track" id="trackOffBtn" onclick="setTrack('off')">关闭跟随</button>
+      <span id="trackState" style="font-size:13px;color:#9c9;margin-left:6px">跟随: 关</span>
+    </div>
     <div id="chat"></div>
     <div class="row">
       <input id="text" placeholder="也可以打字：停下 / 过来 / 报告 / 左转 / 看我" onkeydown="if(event.key==='Enter')sendChat()">
@@ -636,6 +673,26 @@ async function toggleListen(){
   document.getElementById('listenBtn').textContent = cur ? '继续监听' : '暂停监听';
   pollMsgs();
 }
+async function setTrack(mode){
+  const body = mode === 'off' ? {on:false} : {on:true, mode};
+  try{
+    const r = await fetch('/api/track',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j = await r.json();
+    if(!r.ok || j.ok === false){ addMsg('sys','跟随错误: '+(j.error||('HTTP '+r.status))); }
+  }catch(e){ addMsg('sys','跟随错误: '+e); }
+  pollTrack();
+}
+async function pollTrack(){
+  let j;
+  try{ j = await (await fetch('/api/track')).json(); }catch(e){ return; }
+  const running = !!j.running, mode = j.mode || null;
+  document.getElementById('trackHeadBtn').classList.toggle('on', running && mode==='head');
+  document.getElementById('trackFollowBtn').classList.toggle('on', running && mode==='follow');
+  document.getElementById('trackOffBtn').classList.toggle('on', !running);
+  document.getElementById('trackState').textContent =
+    running ? ('跟随: ' + (mode==='follow' ? '头部+底盘' : '仅头部') + ' (pid ' + j.pid + ')')
+            : '跟随: 关';
+}
 async function pollStatus(){
   try{
     const r=await fetch('/api/status'); const j=await r.json();
@@ -693,7 +750,8 @@ async function resetAgent(){
 loadAgent().catch(e=>{document.getElementById('agentMsg').textContent=e.message;});
 setInterval(pollMsgs,700);
 setInterval(pollStatus,2000);
-pollMsgs(); pollStatus();
+setInterval(pollTrack,2000);
+pollMsgs(); pollStatus(); pollTrack();
 </script></body></html>
 """
 

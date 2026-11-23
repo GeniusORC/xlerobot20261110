@@ -83,12 +83,20 @@ tr.sel td{background:#233247}
   </div>
 
   <div class="card">
-    <h2>跟随</h2>
+    <h2>人脸跟随</h2>
     <div class="row">
-      <button id="followBtn" onclick="toggleFollow()">跟随：关</button>
+      <button id="trackHeadBtn" onclick="setTrack('head')">仅头部</button>
+      <button id="trackFollowBtn" onclick="setTrack('follow')">头部+底盘</button>
+      <button id="trackOffBtn" class="stop" onclick="setTrack('off')">关闭</button>
+    </div>
+    <p class="hint" id="trackHint">追踪器状态读取中…</p>
+    <div class="row">
+      <button id="followBtn" onclick="toggleFollow()">跟随许可：关</button>
       <span class="hint" id="followHint" style="margin:0"></span>
     </div>
-    <p class="hint">跟随由 head_track.py 驱动；这里只切换机器人的跟随许可（latch）。</p>
+    <p class="hint">仅头部 = 头部相机锁定人脸并转动俯仰/偏航，底盘不动；头部+底盘 =
+      额外由 head_track.py 驱动底盘保持约 1 m 距离。下面的“跟随许可”是 robot_api 的
+      latch，由追踪器每秒心跳维持，语音“停下”会同时关闭。</p>
   </div>
 
   <div class="card">
@@ -255,6 +263,32 @@ async function toggleFollow(){
   await j('POST','/follow', {on});
   await poll();
   toast(on ? '跟随许可已打开' : '跟随许可已关闭');
+}
+
+async function setTrack(mode){
+  const body = mode === 'off' ? {on:false} : {on:true, mode};
+  try{
+    const r = await fetch('/api/track', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)});
+    const d = await r.json().catch(() => ({error:'HTTP '+r.status}));
+    if(!r.ok || d.ok === false){ toast((d && d.error) || ('HTTP '+r.status), true); }
+    else { toast(mode === 'off' ? '人脸跟随已关闭'
+                 : (mode === 'follow' ? '头部+底盘跟随已启动' : '仅头部跟随已启动')); }
+  }catch(e){ toast('网络错误: ' + e, true); }
+  setTimeout(pollTrack, 1500);
+}
+
+async function pollTrack(){
+  let t;
+  try { t = await (await fetch('/api/track')).json(); } catch(_){ return; }
+  const running = !!t.running, mode = t.mode || null;
+  $('trackHeadBtn').classList.toggle('on', running && mode === 'head');
+  $('trackFollowBtn').classList.toggle('on', running && mode === 'follow');
+  $('trackOffBtn').classList.toggle('on', !running);
+  $('trackHint').textContent = running
+    ? ('追踪器运行中 · ' + (mode === 'follow' ? '头部+底盘' : '仅头部') + ' · pid ' + t.pid)
+    : '追踪器未运行';
 }
 
 async function poll(){
@@ -475,6 +509,8 @@ function toggleAutoLog(){
 
 poll();
 setInterval(poll, 2000);
+pollTrack();
+setInterval(pollTrack, 2000);
 pollHealth();
 setInterval(pollHealth, 5000);
 loadPoses();

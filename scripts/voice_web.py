@@ -31,6 +31,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import agent_brain
 import face_client as face
+import track_manager
 import vision_context
 from voice_loop import tts, transcribe, vad_trim
 from config_loader import CFG, service_url
@@ -57,10 +58,32 @@ FOLLOW_OFF_WORDS = ("别跟着", "不要跟着", "不用跟着", "别跟了", "�
 # follow command has to be a short sentence, not merely contain the words.
 FOLLOW_ON_WORDS = ("跟着我", "跟我走", "跟我来", "跟上我", "跟着我走")
 
+# Head face-tracking (no base motion). Kept distinct from base follow: these ask
+# the robot to keep looking at the person, not to drive after them.
+TRACK_ON_WORDS = ("看着我", "看住我", "盯着我", "跟着我的脸", "看着我的脸",
+                  "头部跟随", "头跟着我", "自动跟随", "开始跟随")
+TRACK_OFF_WORDS = ("别看着我", "不要看我", "别看我", "别盯着我", "停止跟随",
+                   "关闭跟随", "别跟了", "不跟了")
+
 
 def wants_follow(text: str) -> bool:
     t = (text or "").strip().strip("。！!，,. ")
     return len(t) <= 8 and any(w in t for w in FOLLOW_ON_WORDS)
+
+
+def wants_head_track(text: str) -> bool:
+    """Short imperative request to keep the head aimed at the person's face.
+
+    Length-capped like wants_follow so a narrative sentence such as
+    "我孙子看着我去公园" (which merely contains "看着我") stays a chat turn.
+    The longest real command is five characters ("看着我的脸").
+    """
+    t = (text or "").strip().strip("。！!，,.?？ ")
+    return len(t) <= 6 and any(w in t for w in TRACK_ON_WORDS)
+
+
+def wants_track_off(text: str) -> bool:
+    return any(w in (text or "") for w in TRACK_OFF_WORDS)
 
 EMERGENCY_WORDS = (
     "胸痛", "胸口疼", "呼吸困难", "喘不过", "说不出话", "嘴歪", "半身",
@@ -147,6 +170,21 @@ def robot_follow(on: bool = True) -> dict:
         return r.json()
     except Exception as e:
         return {"error": f"robot API: {type(e).__name__}: {e}"}
+
+
+def start_head_tracking(mode: str = "head") -> dict:
+    """Start the face head-tracker (head-only or head+base follow)."""
+    ok, payload = track_manager.start(mode)
+    if not ok:
+        return {"error": payload.get("error", "tracker failed to start")}
+    return payload
+
+
+def stop_head_tracking() -> dict:
+    ok, payload = track_manager.stop()
+    if not ok:
+        return {"error": "tracker failed to stop"}
+    return payload
 
 
 def robot_move(forward_m: float = 0.0, turn_deg: float = 0.0) -> dict:
@@ -361,28 +399,56 @@ def route_text(text: str) -> dict:
 
     # "停下" must stop the base even if the model would rather chat about it.
     if map_intent(text) == "stop":
-        return {**handle_intent("stop", text), "mode": "command",
-                "engine": "keyword"}
+        out = {**handle_intent("stop", text), "mode": "command",
+               "engine": "keyword"}
+        # A stop also ends face head-tracking: the head should not keep panning
+        # after the operator has asked everything to stop.
+        out["tracker"] = stop_head_tracking()
+        return out
 
     # Same for ending follow: "别跟着我了" answered as chat would leave the
     # base following while the robot says it stopped, so revoke the latch in
     # code instead of trusting the tool call.
-    if any(w in text for w in FOLLOW_OFF_WORDS):
+    if any(w in text for w in FOLLOW_OFF_WORDS) or wants_track_off(text):
         result = robot_follow(False)
-        reply = "好，我不跟了。"
+        stopped = stop_head_tracking()
+        reply = "好，我不跟了，也不盯着您了。" if wants_track_off(text) else "好，我不跟了。"
         if isinstance(result, dict) and result.get("error"):
             reply = "我这边连不上机器人，请检查电源和串口。"
         _push_history(text, reply)
         return {"text": text, "intent": "follow_me", "reply": reply,
-                "engine": "keyword", "robot": result,
+                "engine": "keyword", "robot": result, "tracker": stopped,
                 "audio": speech_file(reply), "mode": "command"}
 
-    # "跟着我" is short and imperative: start following without waiting for a
-    # model turn, and let handle_action check that a follower is really running.
+    # Head face-tracking, no wheel motion: "看着我" keeps the head aimed at the
+    # face. Handled in code so it works even when the LLM is unreachable.
+    if wants_head_track(text):
+        result = start_head_tracking("head")
+        if result.get("error"):
+            reply = "头部跟随没启动起来，请确认机器人已连接。"
+        else:
+            reply = ("好的，我会用头部相机看着您的脸，您走到哪我看到哪。"
+                     if not result.get("already")
+                     else "我已经在看着您了。")
+        _push_history(text, reply)
+        return {"text": text, "intent": "head_track", "reply": reply,
+                "engine": "keyword", "tracker": result,
+                "audio": speech_file(reply), "mode": "command"}
+
+    # "跟着我" is short and imperative: start the head+base follower so the
+    # wheels actually trail the person, then enable the robot_api follow latch.
     if wants_follow(text):
+        started = start_head_tracking("follow")
+        if started.get("error"):
+            reply = "跟人的程序没启动起来，请确认机器人已连接。"
+            _push_history(text, reply)
+            return {"text": text, "intent": "follow_me", "reply": reply,
+                    "engine": "keyword", "tracker": started,
+                    "audio": speech_file(reply), "mode": "command"}
         out = handle_action({"action": "follow_me", "args": {"on": True},
                              "reply": "", "engine": "keyword"}, text)
         out["engine"] = "keyword"
+        out["tracker"] = started
         return out
 
     # One function-calling turn decides chat vs. robot action, with a one-line
@@ -482,6 +548,35 @@ def api_voice():
 @app.get("/api/status")
 def api_status():
     return jsonify(robot_status())
+
+
+@app.get("/api/track")
+def api_track_status():
+    """Whether the face/head tracker is running and in which mode."""
+    return jsonify(track_manager.status())
+
+
+@app.post("/api/track")
+def api_track_set():
+    """Start/stop face head-tracking.
+
+    Body: {"on": true, "mode": "head"|"follow", "standoff": 1.0}.
+    "head" only moves the pan/tilt servos; "follow" also lets the base trail
+    the person. A voice "停下" still revokes base follow inside robot_api.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    on = bool(data.get("on", True))
+    if not on:
+        ok, payload = track_manager.stop()
+        return jsonify({"ok": ok, **payload}), (200 if ok else 502)
+    mode = str(data.get("mode", "head")).strip().lower()
+    if mode not in track_manager.MODES:
+        return jsonify({"ok": False, "error": f"mode must be one of {track_manager.MODES}"}), 400
+    standoff = data.get("standoff")
+    ok, payload = track_manager.start(mode, standoff=standoff)
+    if not ok:
+        return jsonify({"ok": False, **payload}), 503
+    return jsonify({"ok": True, **payload})
 
 
 @app.get("/audio/<name>")

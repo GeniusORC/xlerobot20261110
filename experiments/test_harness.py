@@ -71,8 +71,87 @@ def test_run_dir_sharing():
         return ok
 
 
+def _stub_tracker():
+    """Replace tracker side effects with an in-memory call log (no subprocess)."""
+    calls = []
+
+    def fake_start(mode, standoff=None):
+        if mode not in voice_web.track_manager.MODES:
+            return False, {"error": "bad mode"}
+        calls.append(("start", mode))
+        return True, {"running": True, "mode": mode, "pid": 4242}
+
+    def fake_stop():
+        calls.append(("stop", None))
+        return True, {"running": False, "stopped_pid": 4242}
+
+    voice_web.track_manager.start = fake_start
+    voice_web.track_manager.stop = fake_stop
+    voice_web.robot_follow = lambda on: {"ok": True, "follow": on}
+    voice_web.handle_intent = lambda intent, text="": {"intent": intent, "reply": "ok"}
+    voice_web.speech_file = lambda t: None
+    voice_web._push_history = lambda *a, **k: None
+    return calls
+
+
+def test_head_track_routing():
+    calls = _stub_tracker()
+    good = []
+
+    # Head-only phrases start the tracker in head mode and never touch base.
+    for t in ("看着我", "盯着我", "看着我的脸"):
+        calls.clear()
+        out = voice_web.route_text(t)
+        good.append(check(f"head intent {t}", out.get("intent"), "head_track"))
+        good.append(check(f"head engine {t}", out.get("engine"), "keyword"))
+        good.append(check(f"head mode {t}", calls, [("start", "head")]))
+
+    # Base follow phrases start the follower in follow mode.
+    for t in ("跟着我", "跟我走"):
+        calls.clear()
+        out = voice_web.route_text(t)
+        good.append(check(f"follow intent {t}", out.get("intent"), "follow_me"))
+        good.append(check(f"follow mode {t}", ("start", "follow") in calls, True))
+
+    # Off / stop phrases stop the tracker process, not just the base latch.
+    for t in ("别跟了", "别看着我", "停下"):
+        calls.clear()
+        voice_web.route_text(t)
+        good.append(check(f"stop tracker {t}", ("stop", None) in calls, True))
+
+    # Narrative sentences containing the phrases must not start anything.
+    for t in ("我孙子看着我去公园", "昨天我跟着我儿子买菜"):
+        calls.clear()
+        voice_web.route_text(t)
+        good.append(check(f"no motion {t}", any(c[0] == "start" for c in calls), False))
+    return all(good)
+
+
+def test_track_manager_state():
+    import track_manager
+    good = []
+    # Invalid modes are rejected.
+    ok, payload = track_manager.start("bogus")
+    good.append(check("reject bad mode", ok, False))
+    good.append(check("bad mode error", "error" in payload, True))
+    # A stale PID left by a dead process is reconciled to "not running".
+    track_manager.RUN_DIR.mkdir(parents=True, exist_ok=True)
+    track_manager.PID_FILE.write_text("999999")
+    track_manager.MODE_FILE.write_text("head")
+    st = track_manager.status()
+    good.append(check("stale pid cleared", st["running"], False))
+    good.append(check("stale pid value", st["pid"], None))
+    good.append(check("pid file removed", track_manager.PID_FILE.exists(), False))
+    # Stop with nothing running is a clean no-op.
+    ok, payload = track_manager.stop()
+    good.append(check("stop idle ok", ok, True))
+    return all(good)
+
+
 def main():
-    results = [test_stop_and_intent(), test_narration_guard(), test_run_dir_sharing()]
+    results = [test_stop_and_intent(), test_narration_guard(),
+               test_run_dir_sharing(), test_head_track_routing(),
+               test_track_manager_state()]
     print("\nALL PASS" if all(results) else "\nFAILURES PRESENT")
     return 0 if all(results) else 1
 
