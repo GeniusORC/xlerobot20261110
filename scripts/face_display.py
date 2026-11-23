@@ -13,9 +13,13 @@ Control (HTTP, default port 8086)
   POST /say     {"duration":2.5}            open the mouth for N seconds
   POST /look    {"dx":0.2,"dy":-0.1}        move the pupils, -1..1
   POST /blink
+  GET  /window                     "full" | "windowed" | "hidden"
+  POST /window  {"state":"windowed"}        same actions as the buttons
 
-The window has no title bar, so it draws its own close control: click the dim
-"x" in the top-right corner, or press Esc.  A deliberate close exits with code
+The window has no title bar, so it draws its own three controls in the
+top-right corner, like a title bar: minimize (-), maximize/restore (square) and
+close (x).  Minimize leaves a small face in the corner of the monitor; tap it
+to bring the face back.  Esc also closes.  A deliberate close exits with code
 0 and the supervisor leaves the face closed instead of relaunching it.
 
 Run:
@@ -131,7 +135,31 @@ class FaceState:
 
 
 STATE = FaceState()
+WINDOW = {"view": None}
 app = Flask(__name__)
+
+
+@app.get("/window")
+def api_window():
+    view = WINDOW["view"]
+    if view is None:
+        return jsonify({"state": "starting"}), 503
+    return jsonify({"state": view.window_state,
+                    "monitor": view.monitor,
+                    "controls": view.controls_enabled})
+
+
+@app.post("/window")
+def api_set_window():
+    data = request.get_json(force=True, silent=True) or {}
+    state = str(data.get("state", "")).lower()
+    if state not in ("full", "windowed", "hidden", "toggle"):
+        return jsonify({"error": "state must be full, windowed, hidden or toggle"}), 400
+    view = WINDOW["view"]
+    if view is None:
+        return jsonify({"error": "window not ready"}), 503
+    view.request(state)
+    return jsonify({"ok": True, "requested": state})
 
 
 @app.get("/state")
@@ -221,12 +249,16 @@ def load_envelope(path, rate=50.0):
 
 
 class FaceWindow:
-    # Touch-friendly control: 44 px circle, plus a few px of slop so it is easy
-    # to hit on the laptop touchscreen.
-    CLOSE_R = 22
-    CLOSE_SLOP = 8
+    # Touch-friendly controls: 44 px circles, plus slop so they are easy to hit
+    # on the laptop touchscreen.  Laid out like a window title bar: minimize,
+    # maximize/restore, close, anchored to the top-right corner.
+    R = 22
+    SLOP = 8
+    GAP = 56
+    ORDER = ("minimize", "maximize", "close")
 
-    def __init__(self, root, w, h, fps=33, debug=False, close_button=True):
+    def __init__(self, root, w, h, fps=33, debug=False, controls=True,
+                 monitor=None, state="full"):
         import tkinter as tk
         self.tk = tk
         self.root = root
@@ -235,6 +267,13 @@ class FaceWindow:
                             highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.w, self.h = w, h
+        self.monitor = monitor or {"name": "screen", "w": w, "h": h,
+                                   "x": 0, "y": 0}
+        self.window_state = state
+        self._hidden_from = "full"
+        self._pending = None
+        self._pending_lock = threading.Lock()
+        self.chip = None
         self.next_blink = time.time() + random.uniform(2.0, 5.0)
         self.blink_start = 0.0
 
@@ -256,16 +295,10 @@ class FaceWindow:
             w / 2, h * 0.94, text="", fill=FACE_DIM,
             font=("DejaVu Sans", 12), state="normal" if debug else "hidden")
 
-        # The window is overrideredirect (no title bar), so it owns its close
-        # control.  Draw it last so it sits above every face element.
-        self.close_enabled = close_button
-        hidden = "normal" if close_button else "hidden"
-        self.close_ring = self.cv.create_oval(
-            0, 0, 0, 0, outline=FACE_DIM, width=2, state=hidden)
-        self.close_x = self.cv.create_text(
-            0, 0, text="✕", fill=FACE_DIM, font=("DejaVu Sans", 16), state=hidden)
-        self.close_cx, self.close_cy = w - 34, 34
-        self._layout_close()
+        # The window is overrideredirect (no title bar), so it draws its own
+        # window controls.  They are created last so they sit above the face.
+        self.controls_enabled = controls
+        self._build_controls()
 
         self.cv.bind("<Button-1>", self._on_click)
         self.cv.bind("<Motion>", self._on_motion)
@@ -273,32 +306,197 @@ class FaceWindow:
         self.root.bind("<Escape>", lambda e: self.close("Escape key"))
         self.root.after(200, self.tick)
 
-    def _layout_close(self):
-        cx, cy, r = self.w - 34, 34, self.CLOSE_R
-        self.close_cx, self.close_cy = cx, cy
-        self.cv.coords(self.close_ring, cx - r, cy - r, cx + r, cy + r)
-        self.cv.coords(self.close_x, cx, cy)
+    def _build_controls(self):
+        tk = self.tk
+        shown = "normal" if self.controls_enabled else "hidden"
+        self.buttons = {}
+        for name in self.ORDER:
+            ring = self.cv.create_oval(0, 0, 0, 0, outline=FACE_DIM, width=2,
+                                       state=shown, tags=("control",))
+            self.buttons[name] = {"ring": ring, "cx": 0, "cy": 0, "glyphs": [],
+                                  "alt": []}
+        min_glyph = self.cv.create_line(0, 0, 0, 0, fill=FACE_DIM, width=2,
+                                        capstyle="round", state=shown,
+                                        tags=("control",))
+        self.buttons["minimize"]["glyphs"] = [min_glyph]
+        close_glyph = self.cv.create_text(0, 0, text="✕", fill=FACE_DIM,
+                                          font=("DejaVu Sans", 16),
+                                          state=shown, tags=("control",))
+        self.buttons["close"]["glyphs"] = [close_glyph]
+        # Full screen: one square.  Restored: two overlapping squares.
+        square = self.cv.create_rectangle(0, 0, 0, 0, outline=FACE_DIM,
+                                          width=2, state=shown,
+                                          tags=("control",))
+        self.buttons["maximize"]["glyphs"] = [square]
+        self.buttons["maximize"]["alt"] = [
+            self.cv.create_rectangle(0, 0, 0, 0, outline=FACE_DIM, width=2,
+                                     state="hidden", tags=("control",))
+            for _ in range(2)]
+        self._layout_controls()
 
-    def _in_close(self, ev):
-        dx = ev.x - self.close_cx
-        dy = ev.y - self.close_cy
-        reach = self.CLOSE_R + self.CLOSE_SLOP
-        return dx * dx + dy * dy <= reach * reach
+    def _layout_controls(self):
+        shown = "normal" if self.controls_enabled else "hidden"
+        cy = 34
+        ordered = ("close", "maximize", "minimize")
+        for i, name in enumerate(ordered):
+            cx = self.w - 34 - i * self.GAP
+            b = self.buttons[name]
+            b["cx"], b["cy"] = cx, cy
+            r = self.R
+            self.cv.coords(b["ring"], cx - r, cy - r, cx + r, cy + r)
+            if name == "minimize":
+                for item in b["glyphs"]:
+                    self.cv.coords(item, cx - 8, cy, cx + 8, cy)
+            elif name == "close":
+                for item in b["glyphs"]:
+                    self.cv.coords(item, cx, cy)
+            else:
+                for item in b["glyphs"]:
+                    self.cv.coords(item, cx - 7, cy - 7, cx + 7, cy + 7)
+                back, front = b["alt"]
+                self.cv.coords(back, cx - 9, cy - 9, cx + 1, cy + 1)
+                self.cv.coords(front, cx - 1, cy - 1, cx + 9, cy + 9)
+        # Only the glyph matching the current window state is visible.
+        maximized = self.window_state == "full"
+        self.cv.itemconfig(self.buttons["maximize"]["glyphs"][0],
+                           state=shown if maximized else "hidden")
+        for item in self.buttons["maximize"]["alt"]:
+            self.cv.itemconfig(item, state=shown if not maximized else "hidden")
+
+    def _hit(self, ev):
+        if not self.controls_enabled:
+            return None
+        reach = self.R + self.SLOP
+        for name, b in self.buttons.items():
+            dx, dy = ev.x - b["cx"], ev.y - b["cy"]
+            if dx * dx + dy * dy <= reach * reach:
+                return name
+        return None
+
+    def _paint(self, name, hot):
+        b = self.buttons[name]
+        colour = FACE if hot else FACE_DIM
+        self.cv.itemconfig(b["ring"], outline=colour)
+        for item in b["glyphs"] + b["alt"]:
+            if self.cv.type(item) == "line":
+                self.cv.itemconfig(item, fill=colour)
+            elif self.cv.type(item) == "text":
+                self.cv.itemconfig(item, fill=colour)
+            else:
+                self.cv.itemconfig(item, outline=colour)
 
     def _on_motion(self, ev):
-        if not self.close_enabled:
+        if not self.controls_enabled:
             return
-        hot = self._in_close(ev)
-        self.cv.itemconfig(self.close_ring, outline=FACE if hot else FACE_DIM)
-        self.cv.itemconfig(self.close_x, fill=FACE if hot else FACE_DIM)
+        hot = self._hit(ev)
+        for name in self.buttons:
+            self._paint(name, name == hot)
 
     def _on_click(self, ev):
-        if self.close_enabled and self._in_close(ev):
+        name = self._hit(ev)
+        if name == "close":
             self.close(f"close button at {ev.x},{ev.y}")
+        elif name == "minimize":
+            self.minimize(f"minimize button at {ev.x},{ev.y}")
+        elif name == "maximize":
+            self.toggle_maximize()
+
+    def request(self, action):
+        """Queue a window action from the HTTP thread, applied in tick()."""
+        with self._pending_lock:
+            self._pending = action
+
+    def _take_request(self):
+        with self._pending_lock:
+            pending, self._pending = self._pending, None
+        return pending
+
+    def apply_window(self, state):
+        if state == "hidden":
+            self.minimize("api")
+            return
+        if state not in ("full", "windowed"):
+            return
+        self._hide_chip()
+        w, h, x, y = self._geometry(state)
+        if self.root.state() == "withdrawn":
+            self.root.deiconify()
+        # Keep it frameless and unmanaged; only the drawn controls act on it.
+        self.root.overrideredirect(True)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.window_state = state
+        self._layout_controls()
+
+    def toggle_maximize(self):
+        if self.window_state == "hidden":
+            self.apply_window(self._hidden_from)
+        elif self.window_state == "full":
+            self.apply_window("windowed")
+        else:
+            self.apply_window("full")
+
+    def _geometry(self, state):
+        m = self.monitor
+        if state == "windowed":
+            w = max(640, int(m["w"] * 0.6))
+            h = max(480, int(m["h"] * 0.6))
+            return (w, h, m["x"] + (m["w"] - w) // 2,
+                    m["y"] + (m["h"] - h) // 2)
+        return m["w"], m["h"], m["x"], m["y"]
+
+    def minimize(self, reason="api"):
+        if self.window_state == "hidden":
+            return
+        print(f"face display minimized ({reason})", flush=True)
+        self._hidden_from = self.window_state
+        self.window_state = "hidden"
+        self.root.withdraw()
+        self._show_chip()
+
+    def _show_chip(self):
+        """When minimized, leave a small face in the corner to tap and restore."""
+        tk = self.tk
+        if self.chip is not None:
+            try:
+                if self.chip.winfo_exists():
+                    self.chip.deiconify()
+                    return
+            except Exception:
+                pass
+        m = self.monitor
+        cw, ch = 190, 64
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.geometry(f"{cw}x{ch}+{m['x'] + m['w'] - cw - 24}+{m['y'] + 24}")
+        cv = tk.Canvas(top, width=cw, height=ch, bg=BG, bd=0,
+                       highlightthickness=1, highlightbackground=FACE_DIM)
+        cv.pack(fill="both", expand=True)
+        cy = ch / 2 - 6
+        for dx in (-11, 11):
+            cv.create_oval(cw / 2 + dx - 6, cy - 7, cw / 2 + dx + 6, cy + 7,
+                           fill=FACE, outline=FACE_EDGE, width=1)
+        cv.create_arc(cw / 2 - 12, cy + 2, cw / 2 + 12, cy + 20,
+                      start=200, extent=140, style="arc", outline=MOUTH, width=2)
+        cv.create_text(cw / 2, ch - 12, text="restore", fill=FACE_DIM,
+                       font=("DejaVu Sans", 9))
+        for widget in (top, cv):
+            widget.bind("<Button-1>",
+                        lambda e: self.apply_window(self._hidden_from))
+        self.chip = top
+
+    def _hide_chip(self):
+        if self.chip is not None:
+            try:
+                self.chip.destroy()
+            except Exception:
+                pass
+            self.chip = None
 
     def close(self, reason="api"):
         """Close deliberately: exit 0 so the supervisor leaves the face closed."""
         print(f"face display closing ({reason})", flush=True)
+        self._hide_chip()
         try:
             self.root.destroy()
         except Exception:
@@ -306,11 +504,16 @@ class FaceWindow:
 
     def _resize(self, ev):
         self.w, self.h = max(320, ev.width), max(240, ev.height)
-        if hasattr(self, "close_ring"):
-            self._layout_close()
+        if hasattr(self, "buttons"):
+            self._layout_controls()
 
     def tick(self):
         now = time.time()
+        pending = self._take_request()
+        if pending == "toggle":
+            self.toggle_maximize()
+        elif pending:
+            self.apply_window(pending)
         st = STATE.snapshot()
         emo = EMOTIONS.get(st["emotion"], EMOTIONS["neutral"])
         k = st["intensity"]
@@ -411,8 +614,9 @@ def main():
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--debug", action="store_true",
                     help="show the emotion name on screen")
-    ap.add_argument("--no-close-button", action="store_true",
-                    help="hide the on-screen close control (Esc still works)")
+    ap.add_argument("--no-controls", "--no-close-button", dest="no_controls",
+                    action="store_true",
+                    help="hide the on-screen window controls (Esc still closes)")
     ap.add_argument("--list-monitors", action="store_true")
     args = ap.parse_args()
 
@@ -447,11 +651,14 @@ def main():
     else:
         root.geometry("1200x800")
         w, h = 1200, 800
-    FaceWindow(root, w, h, debug=args.debug,
-               close_button=bool(face_cfg.get("close_button", True))
-               and not args.no_close_button)
+    view = FaceWindow(root, w, h, debug=args.debug,
+                      controls=bool(face_cfg.get("controls", True))
+                      and not args.no_controls,
+                      monitor=geo, state="full" if geo else "windowed")
+    WINDOW["view"] = view
     print(f"face on {geo or 'window'} | http://127.0.0.1:{args.port}", flush=True)
     root.mainloop()
+    WINDOW["view"] = None
     return 0
 
 

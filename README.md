@@ -58,7 +58,7 @@ One command brings the whole stack up:
 | `voice_auto_web.py` | 8082 | always-on voice (no push-to-talk), chat, lip-sync |
 | `health_station_web.py` | 8084 | gait capture and reports |
 | `robot_api.py` | 8090 | base / head / arms |
-| `face_display.py` | 8086 | the laptop panel as the robot's face |
+| `face_display.py` | 8086 | the robot's face: full screen on `face.monitor`, with its own minimise / maximise / close buttons |
 | `head_track.py` | — | turns the head to keep your face centred; `--follow` drives the base too |
 
 The interaction loop is not a keyword bot: one DeepSeek function-calling turn

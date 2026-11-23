@@ -1335,6 +1335,25 @@ face owns the laptop panel (`face.monitor: 1`), so use the second monitor
 `face.monitor: 2` in `config.yaml` and restart the stack; check the numbering
 with `.venv/bin/python scripts/face_display.py --list-monitors`.
 
+The face window has no title bar, so it draws its own three controls in the
+top-right corner, in title-bar order:
+
+| Control | What it does |
+|---|---|
+| `−` minimize | hides the face and leaves a small face in the corner of the same monitor; tap it to restore |
+| `□` maximize / restore | toggles between the whole monitor and a centred 60 % window |
+| `✕` close | stops the display; the supervisor leaves it closed until you ask for it back |
+
+`Esc` also closes.  To bring a closed face back without touching the rest of
+the stack:
+
+```bash
+./scripts/start_demo.sh --face      # SIGHUP to the supervisor, face only
+curl -s -X POST http://127.0.0.1:8086/window -H 'Content-Type: application/json' \
+     -d '{"state":"full"}'          # same actions over HTTP: full|windowed|hidden|toggle
+curl -s http://127.0.0.1:8086/window   # current state and monitor geometry
+```
+
 ### Head tracking
 
 `head_track.py` closes the loop on **pixels**, not motor angles:

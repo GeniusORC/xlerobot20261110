@@ -38,7 +38,7 @@ face:
   # 1-based index from `xrandr` order: 1 = laptop panel, 2 = external monitor.
   # Check with: .venv/bin/python scripts/face_display.py --list-monitors
   monitor: 2
-  close_button: true           # on-screen ✕ in the top-right corner
+  controls: true               # on-screen minimize / maximize / close buttons
 
 logs:
   dir: "data/logs"             # relative to project root; persistent across reboots

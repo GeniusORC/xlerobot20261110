@@ -26,8 +26,8 @@ def commands():
     face = CFG.get("face") or {}
     face_cmd = [voice, "scripts/face_display.py",
                 "--monitor", str(face.get("monitor", 1))]
-    if not face.get("close_button", True):
-        face_cmd.append("--no-close-button")
+    if not face.get("controls", True):
+        face_cmd.append("--no-controls")
     cmds = {
         "camera_web": [robot, "scripts/camera_web.py", "--port", "8080"],
         "robot_api": [robot, "scripts/robot_api.py", "--port", "8090"],
