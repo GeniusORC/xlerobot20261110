@@ -13,6 +13,7 @@ the two behaviors a reviewer would most want to see verified:
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -150,25 +151,56 @@ def test_head_track_routing():
     return all(good)
 
 
-def test_track_manager_state():
+@contextmanager
+def _isolated_track_manager():
+    """Redirect every track_manager path into a temp dir.
+
+    Without this, the start() success path appends a "# tracker start" marker
+    to the real data/logs/head_track.log and writes PID files under data/run,
+    polluting the production log the watcher reads. The lock must move too or
+    two test runs would contend on the real advisory lock.
+    """
     import track_manager
-    good = []
-    # Invalid modes are rejected.
-    ok, payload = track_manager.start("bogus")
-    good.append(check("reject bad mode", ok, False))
-    good.append(check("bad mode error", "error" in payload, True))
-    # A stale PID left by a dead process is reconciled to "not running".
-    track_manager.RUN_DIR.mkdir(parents=True, exist_ok=True)
-    track_manager.PID_FILE.write_text("999999")
-    track_manager.MODE_FILE.write_text("head")
-    st = track_manager.status()
-    good.append(check("stale pid cleared", st["running"], False))
-    good.append(check("stale pid value", st["pid"], None))
-    good.append(check("pid file removed", track_manager.PID_FILE.exists(), False))
-    # Stop with nothing running is a clean no-op.
-    ok, payload = track_manager.stop()
-    good.append(check("stop idle ok", ok, True))
-    return all(good)
+    saved = {name: getattr(track_manager, name) for name in
+             ("RUN_DIR", "LOG_DIR", "PID_FILE", "MODE_FILE",
+              "LOCK_FILE", "LOG_FILE")}
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "run"
+        log = Path(tmp) / "logs"
+        run.mkdir()
+        log.mkdir()
+        track_manager.RUN_DIR = run
+        track_manager.LOG_DIR = log
+        track_manager.PID_FILE = run / "head_track.pid"
+        track_manager.MODE_FILE = run / "head_track.mode"
+        track_manager.LOCK_FILE = run / "head_track.lock"
+        track_manager.LOG_FILE = log / "head_track.log"
+        try:
+            yield track_manager
+        finally:
+            for name, val in saved.items():
+                setattr(track_manager, name, val)
+
+
+def test_track_manager_state():
+    with _isolated_track_manager() as track_manager:
+        good = []
+        # Invalid modes are rejected.
+        ok, payload = track_manager.start("bogus")
+        good.append(check("reject bad mode", ok, False))
+        good.append(check("bad mode error", "error" in payload, True))
+        # A stale PID left by a dead process is reconciled to "not running".
+        track_manager.RUN_DIR.mkdir(parents=True, exist_ok=True)
+        track_manager.PID_FILE.write_text("999999")
+        track_manager.MODE_FILE.write_text("head")
+        st = track_manager.status()
+        good.append(check("stale pid cleared", st["running"], False))
+        good.append(check("stale pid value", st["pid"], None))
+        good.append(check("pid file removed", track_manager.PID_FILE.exists(), False))
+        # Stop with nothing running is a clean no-op.
+        ok, payload = track_manager.stop()
+        good.append(check("stop idle ok", ok, True))
+        return all(good)
 
 
 def test_track_manager_concurrency():
@@ -180,66 +212,65 @@ def test_track_manager_concurrency():
     """
     import threading
     import time
-    import track_manager
+    with _isolated_track_manager() as track_manager:
+        spawned, issued = [], set()
 
-    spawned, issued = [], set()
+        class FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.returncode = None
 
-    class FakeProc:
-        def __init__(self, pid):
-            self.pid = pid
-            self.returncode = None
+            def poll(self):
+                return self.returncode
 
-        def poll(self):
-            return self.returncode
+        real_popen = track_manager.subprocess.Popen
+        real_robot = track_manager._robot_reachable
+        real_alive = track_manager._alive
+        real_ours = track_manager._is_our_tracker
 
-    real_popen = track_manager.subprocess.Popen
-    real_robot = track_manager._robot_reachable
-    real_alive = track_manager._alive
-    real_ours = track_manager._is_our_tracker
+        def fake_popen(cmd, **kw):
+            time.sleep(0.3)  # widen the race window between spawn and PID write
+            p = FakeProc(7000 + len(spawned))
+            spawned.append(p)
+            issued.add(p.pid)  # monotonic: a stopped PID is never reissued
+            return p
 
-    def fake_popen(cmd, **kw):
-        time.sleep(0.3)  # widen the race window between spawn and PID write
-        p = FakeProc(7000 + len(spawned))
-        spawned.append(p)
-        issued.add(p.pid)  # monotonic: a stopped PID is never reissued
-        return p
+        track_manager.subprocess.Popen = fake_popen
+        track_manager._robot_reachable = lambda: True
+        track_manager._alive = lambda pid: pid in issued
+        track_manager._is_our_tracker = lambda pid: True
+        track_manager._clear_state()  # start from no tracker despite earlier tests
+        try:
+            results = []
+            threads = [threading.Thread(
+                target=lambda: results.append(track_manager.start("head")[0]))
+                for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
-    track_manager.subprocess.Popen = fake_popen
-    track_manager._robot_reachable = lambda: True
-    track_manager._alive = lambda pid: pid in issued
-    track_manager._is_our_tracker = lambda pid: True
-    track_manager._clear_state()  # start from no tracker despite earlier tests
-    try:
-        results = []
-        threads = [threading.Thread(
-            target=lambda: results.append(track_manager.start("head")[0]))
-            for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            good = [check("concurrent spawn count", len(spawned), 1),
+                    check("all starts ok", all(results), True),
+                    check("one running tracker", track_manager.status()["running"], True)]
 
-        good = [check("concurrent spawn count", len(spawned), 1),
-                check("all starts ok", all(results), True),
-                check("one running tracker", track_manager.status()["running"], True)]
+            # A mode switch under the lock still restarts cleanly exactly once.
+            spawned.clear()
+            ok, _ = track_manager.start("follow")
+            good.append(check("mode switch ok", ok, True))
+            good.append(check("mode now follow", track_manager.status()["mode"], "follow"))
+            good.append(check("switch spawned once", len(spawned), 1))
 
-        # A mode switch under the lock still restarts cleanly exactly once.
-        spawned.clear()
-        ok, _ = track_manager.start("follow")
-        good.append(check("mode switch ok", ok, True))
-        good.append(check("mode now follow", track_manager.status()["mode"], "follow"))
-        good.append(check("switch spawned once", len(spawned), 1))
-
-        ok, _ = track_manager.stop()
-        good.append(check("locked stop ok", ok, True))
-        good.append(check("stopped after lock", track_manager.status()["running"], False))
-        return all(good)
-    finally:
-        track_manager.subprocess.Popen = real_popen
-        track_manager._robot_reachable = real_robot
-        track_manager._alive = real_alive
-        track_manager._is_our_tracker = real_ours
-        track_manager._clear_state()
+            ok, _ = track_manager.stop()
+            good.append(check("locked stop ok", ok, True))
+            good.append(check("stopped after lock", track_manager.status()["running"], False))
+            return all(good)
+        finally:
+            track_manager.subprocess.Popen = real_popen
+            track_manager._robot_reachable = real_robot
+            track_manager._alive = real_alive
+            track_manager._is_our_tracker = real_ours
+            track_manager._clear_state()
 
 
 def main():

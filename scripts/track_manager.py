@@ -105,6 +105,14 @@ def _clear_state():
     MODE_FILE.unlink(missing_ok=True)
 
 
+def _log_repr():
+    """Project-relative log path when possible, absolute path otherwise."""
+    try:
+        return str(LOG_FILE.relative_to(ROOT))
+    except ValueError:
+        return str(LOG_FILE)
+
+
 def status():
     """Reconcile the PID file and return the current tracker state."""
     pid = _read_pid()
@@ -122,7 +130,7 @@ def status():
         "running": pid is not None,
         "mode": mode,
         "pid": pid,
-        "log": str(LOG_FILE.relative_to(ROOT)) if LOG_FILE.exists() else None,
+        "log": _log_repr() if LOG_FILE.exists() else None,
     }
 
 
@@ -182,7 +190,7 @@ def _start_locked(mode, standoff):
                                 f"{proc.returncode}); see {LOG_FILE}"}
 
     return True, {"running": True, "mode": mode, "pid": proc.pid,
-                  "log": str(LOG_FILE.relative_to(ROOT))}
+                  "log": _log_repr()}
 
 
 def stop():
