@@ -5,7 +5,10 @@ Moves one arm a few units and checks which camera image changes.  Run with
 robot_api stopped (it owns the serial bus).
 """
 import sys
+import os
 import time
+sys.path.insert(0, os.path.dirname(__file__))
+from config_loader import CFG
 
 import cv2
 import numpy as np
@@ -35,10 +38,11 @@ def shots():
 
 
 def main():
-    cfg = XLerobot2WheelsConfig(port1="/dev/xlerobot_serial_b",
-                                port2="/dev/xlerobot_serial_a",
-                                id="xlerobot", wheel_radius=0.0635,
-                                wheelbase=0.414, cameras={})
+    cfg = XLerobot2WheelsConfig(port1=CFG["motors"]["port_bus1"],
+                                port2=CFG["motors"]["port_bus2"],
+                                id="xlerobot",
+                                wheel_radius=CFG["robot"]["wheel_radius_m"],
+                                wheelbase=CFG["robot"]["wheelbase_m"], cameras={})
     robot = XLerobot2Wheels(cfg)
     import builtins
     orig = builtins.input

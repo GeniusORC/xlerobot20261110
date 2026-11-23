@@ -21,6 +21,9 @@ Endpoints:
 """
 import argparse
 import builtins
+import math
+import json
+from pathlib import Path
 import os
 import queue
 import threading
@@ -33,10 +36,12 @@ import requests
 from flask import Flask, jsonify, request
 
 from lerobot_robot_xlerobot_2wheels import XLerobot2Wheels, XLerobot2WheelsConfig
+from config_loader import CFG, project_path, service_url
 
 app = Flask(__name__)
 STATE = {
     "connected": False,
+    "api_ready": True,
     "busy": False,
     "last_intent": None,
     "message": "starting",
@@ -51,6 +56,9 @@ STOP_EVENT = threading.Event()
 ROBOT = None
 SHUTDOWN = False
 BUS_LOCK = threading.Lock()
+ARM_LOCK = threading.Lock()
+ARM_STOP = threading.Event()
+POSE_DIR = project_path("data/poses")
 
 # Head pan/tilt are ordinary STS3215 position servos on bus1 (IDs 7 and 8).
 # Values are normalized to [-100, 100]; 0 is the calibration midpoint.
@@ -71,7 +79,7 @@ HEAD_REF = {"pan": None, "tilt": None}
 # Where "reset" puts the head.  The calibration midpoint (0) points at the
 # table on this build, so resetting to 0 leaves the robot staring at the desk;
 # -63.6 is the eye-level pose measured on 2026-11-16.
-HEAD_EYE_TILT = float(os.environ.get("HEAD_EYE_TILT", "-63.6"))
+HEAD_EYE_TILT = float(os.environ.get("HEAD_EYE_TILT", CFG["robot"]["head_eye_tilt"]))
 
 # Short-lease velocity command used by continuous following. The base keeps
 # moving only while the health station keeps refreshing this lease. Approaching
@@ -198,6 +206,7 @@ def _set_head(pan=None, tilt=None, dpan=None, dtilt=None, center=False):
 
 def _stop():
     STOP_EVENT.set()
+    ARM_STOP.set()
     try:
         ROBOT.stop_base()
     except Exception:
@@ -213,6 +222,7 @@ def _reset_motion():
     maintenance action, and dropping torque on a loaded arm makes it fall.
     """
     STOP_EVENT.set()
+    ARM_STOP.set()
     FOLLOW["on"] = False
     VEL.update(x=0.0, theta=0.0, lease=0.0)
     set_state(follow=False, x_vel=0.0, theta_vel=0.0,
@@ -319,7 +329,7 @@ def _look_at_person():
     try:
         while time.time() < deadline and not STOP_EVENT.is_set():
             try:
-                r = requests.get("http://127.0.0.1:8080/snapshot/head", timeout=1)
+                r = requests.get(service_url("camera_web") + "/snapshot/head", timeout=1)
                 r.raise_for_status()
                 img = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
             except Exception:
@@ -447,6 +457,7 @@ def worker():
 @app.get("/status")
 def status():
     out = get_state()
+    out["ok"] = out.get("api_ready", False)
     # Whether a follow client (head_track --follow) is actually talking to us.
     # The latch alone is not enough: the voice reply must not promise to
     # follow when nothing is driving.
@@ -463,6 +474,7 @@ def command():
     if ROBOT is None or not get_state().get("connected"):
         return jsonify({"error": "robot not connected", **get_state()}), 503
     if intent == "stop":
+        ARM_STOP.set()
         STOP_EVENT.set()
         # A human stop also ends follow mode; otherwise the follow loop would
         # refresh the velocity lease 100 ms later and drive on.
@@ -609,6 +621,7 @@ def follow_heartbeat():
 
 @app.post("/estop")
 def estop():
+    ARM_STOP.set()
     STOP_EVENT.set()
     FOLLOW["on"] = False
     set_state(follow=False)
@@ -619,6 +632,11 @@ def estop():
             ROBOT.stop_base()
         except Exception:
             pass
+    while True:
+        try:
+            COMMANDS.get_nowait()
+        except queue.Empty:
+            break
     COMMANDS.put("stop")
     return jsonify({"ok": True, **get_state()})
 
@@ -830,7 +848,7 @@ def arm_gripper():
     Body: {"arm": "left"|"right", "open": true|false}
 
     The gripper is the last joint (index 5, ID 6 on each arm).
-    Open = -50 normalized, Closed = +50 normalized (approximate; tune if needed).
+    Gripper range is 0..100 in the upstream driver.
     """
     if ROBOT is None or not get_state().get("connected"):
         return jsonify({"error": "robot not connected"}), 503
@@ -844,14 +862,10 @@ def arm_gripper():
 
     bus = ROBOT.bus1 if arm == "left" else ROBOT.bus2
     motors = ROBOT.left_arm_motors if arm == "left" else ROBOT.right_arm_motors
-    gripper_name = motors[-1]  # last joint is the gripper
+    gripper_name = next(name for name in motors if name.endswith("_gripper"))
 
-    goal = -50.0 if open_it else 50.0
-    try:
-        _rmw(ROBOT.send_action, {f"{gripper_name}.pos": goal})
-        return jsonify({"ok": True, "arm": arm, "gripper": "open" if open_it else "closed", "goal": goal})
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    goal = CFG["arms"]["gripper_open" if open_it else "gripper_closed"]
+    return execute_arm_pose(arm, {gripper_name: goal}, 2.0)
 
 
 @app.post("/arm/pose")
@@ -871,7 +885,28 @@ def arm_pose():
     pose = data.get("pose")
     if not isinstance(pose, dict):
         return jsonify({"error": "pose must be a dict of {motor_name: position}"}), 400
-    duration = float(data.get("duration_s", 2.0))
+    return execute_arm_pose(arm, pose, data.get("duration_s", 2.0))
+
+
+def execute_arm_pose(arm, pose, duration):
+    """Serialize arm trajectories; validate every target before any motor write."""
+    try:
+        duration = float(duration)
+        if not math.isfinite(duration) or not 0.5 <= duration <= 10:
+            raise ValueError("duration_s must be 0.5..10")
+        motors = ROBOT.left_arm_motors if arm == "left" else ROBOT.right_arm_motors
+        if not pose or set(pose) - set(motors):
+            raise ValueError("pose must contain only joints belonging to the selected arm")
+        pose = {name: float(value) for name, value in pose.items()}
+        for name, value in pose.items():
+            lo, hi = (0, 100) if name.endswith("_gripper") else (-98, 98)
+            if not math.isfinite(value) or not lo <= value <= hi:
+                raise ValueError(f"{name} must be {lo}..{hi}")
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not ARM_LOCK.acquire(blocking=False):
+        return jsonify({"error": "another arm operation is active"}), 409
+    ARM_STOP.clear()
 
     bus = ROBOT.bus1 if arm == "left" else ROBOT.bus2
     motors = ROBOT.left_arm_motors if arm == "left" else ROBOT.right_arm_motors
@@ -883,8 +918,16 @@ def arm_pose():
 
         # Interpolate over duration_s at 30 Hz
         fps = 30
-        steps = max(int(duration * fps), 1)
+        max_step = float(CFG["arms"]["max_step"])
+        if not all(name in current and math.isfinite(current[name]) for name in pose):
+            raise ValueError("incomplete joint observation")
+        steps = max(int(duration * fps), math.ceil(max(abs(pose[k] - current[k]) for k in pose) / max_step), 1)
         for i in range(1, steps + 1):
+            if ARM_STOP.is_set():
+                # Hold measured positions; keep torque enabled to support the arm.
+                held = _rmw(bus.sync_read, "Present_Position", motors)
+                _rmw(ROBOT.send_action, {f"{k}.pos": float(v) for k, v in held.items()})
+                return jsonify({"ok": False, "stopped": True}), 409
             alpha = i / steps
             action = {}
             for name in motors:
@@ -895,11 +938,83 @@ def arm_pose():
                     action[f"{name}.pos"] = interp
             if action:
                 _rmw(ROBOT.send_action, action)
-            time.sleep(1.0 / fps)
+            ARM_STOP.wait(1.0 / fps)
 
         return jsonify({"ok": True, "arm": arm, "moved": list(pose.keys())})
     except Exception as e:
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+    finally:
+        ARM_LOCK.release()
+
+
+@app.get("/arm/poses")
+def poses_list():
+    POSE_DIR.mkdir(parents=True, exist_ok=True)
+    return jsonify({"poses": sorted(p.stem for p in POSE_DIR.glob("*.json"))})
+
+
+@app.post("/arm/poses/<name>")
+def poses_save(name):
+    if not name or len(name) > 64 or not all(c.isalnum() or c in "_-" for c in name):
+        return jsonify({"error": "pose name must use letters, numbers, _ or -"}), 400
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected"}), 503
+    state = {}
+    try:
+        for arm_name, bus, motors in (("left", ROBOT.bus1, ROBOT.left_arm_motors),
+                                      ("right", ROBOT.bus2, ROBOT.right_arm_motors)):
+            state[arm_name] = {joint: float(value) for joint, value in
+                               _rmw(bus.sync_read, "Present_Position", motors).items()}
+            if set(state[arm_name]) != set(motors):
+                raise ValueError("incomplete joint observation")
+    except Exception as e:
+        return jsonify({"error": f"joint read failed: {type(e).__name__}"}), 503
+    POSE_DIR.mkdir(parents=True, exist_ok=True)
+    target = POSE_DIR / f"{name}.json"
+    tmp = target.with_suffix(".tmp")
+    with ARM_LOCK:
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        tmp.replace(target)
+    return jsonify({"ok": True, "name": name})
+
+
+@app.post("/arm/poses/<name>/replay")
+def poses_replay(name):
+    if not name or len(name) > 64 or not all(c.isalnum() or c in "_-" for c in name):
+        return jsonify({"error": "invalid name"}), 400
+    if ROBOT is None or not get_state().get("connected"):
+        return jsonify({"error": "robot not connected"}), 503
+    try:
+        pose = json.loads((POSE_DIR / f"{name}.json").read_text())
+    except FileNotFoundError:
+        return jsonify({"error": "pose not found"}), 404
+    except (OSError, json.JSONDecodeError):
+        return jsonify({"error": "pose file is unreadable"}), 400
+    if not isinstance(pose, dict) or set(pose) != {"left", "right"}:
+        return jsonify({"error": "pose file must contain left and right joints"}), 400
+    # Validate both arms and acquire the trajectory lock before moving either.
+    try:
+        validated = {}
+        for arm in ("left", "right"):
+            names = ROBOT.left_arm_motors if arm == "left" else ROBOT.right_arm_motors
+            values = pose[arm]
+            if not isinstance(values, dict) or set(values) != set(names):
+                raise ValueError(f"pose has invalid {arm} joints")
+            validated[arm] = {k: float(v) for k, v in values.items()}
+            for name, value in validated[arm].items():
+                lo, hi = (0, 100) if name.endswith("_gripper") else (-98, 98)
+                if not math.isfinite(value) or not lo <= value <= hi:
+                    raise ValueError(f"{name} outside {lo}..{hi}")
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not ARM_LOCK.acquire(blocking=False):
+        return jsonify({"error": "another arm operation is active"}), 409
+    ARM_LOCK.release()
+    for arm in ("left", "right"):
+        result = execute_arm_pose(arm, validated[arm], 2.0)
+        if isinstance(result, tuple):
+            return result
+    return jsonify({"ok": True, "name": name})
 
 
 def main():
@@ -907,16 +1022,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port1", default="/dev/xlerobot_serial_b")
-    ap.add_argument("--port2", default="/dev/xlerobot_serial_a")
-    ap.add_argument("--wheelbase", type=float, default=0.414)
+    ap.add_argument("--port1", default=CFG["motors"]["port_bus1"])
+    ap.add_argument("--port2", default=CFG["motors"]["port_bus2"])
+    ap.add_argument("--wheelbase", type=float, default=CFG["robot"]["wheelbase_m"])
     args = ap.parse_args()
 
     cfg = XLerobot2WheelsConfig(
         port1=args.port1,
         port2=args.port2,
         id="xlerobot",
-        wheel_radius=0.0635,
+        wheel_radius=CFG["robot"]["wheel_radius_m"],
         wheelbase=args.wheelbase,
         cameras={},  # camera_web owns the RGB devices
     )
@@ -938,6 +1053,7 @@ def main():
     finally:
         SHUTDOWN = True
         STOP_EVENT.set()
+        ARM_STOP.set()
         if ROBOT is not None:
             try:
                 ROBOT.stop_base()

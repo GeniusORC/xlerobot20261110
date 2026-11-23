@@ -1,5 +1,5 @@
 # XLeRobot hardware configuration — single source of truth for this build.
-# All Python scripts read this file via scripts/config_loader.py.
+# Runtime services read this file via scripts/config_loader.py.
 # Never commit secrets here; LLM credentials stay in ~/.config/xlerobot/llm.env
 
 robot:
@@ -38,3 +38,8 @@ logs:
   dir: "data/logs"             # relative to project root; persistent across reboots
   max_bytes: 10485760          # 10 MB per log file before rotation
   backup_count: 3
+
+arms:
+  max_step: 2.0               # normalized units per 30 Hz tick
+  gripper_open: 100.0         # upstream RANGE_0_100; verify physical direction
+  gripper_closed: 0.0

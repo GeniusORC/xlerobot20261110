@@ -18,6 +18,7 @@ When no frontal face is found, a HOG people detector still reports presence
 """
 import io
 import os
+from config_loader import service_url
 import threading
 import time
 
@@ -25,7 +26,7 @@ import cv2
 import numpy as np
 import requests
 
-CAMERA = os.environ.get("CAMERA_API", "http://127.0.0.1:8080").rstrip("/")
+CAMERA = os.environ.get("CAMERA_API") or service_url("camera_web")
 CACHE_S = 1.2
 FACE_W_M = (0.10, 0.30)   # plausible width of a human face
 

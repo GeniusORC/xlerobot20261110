@@ -14,6 +14,10 @@ Control (HTTP, default port 8086)
   POST /look    {"dx":0.2,"dy":-0.1}        move the pupils, -1..1
   POST /blink
 
+The window has no title bar, so it draws its own close control: click the dim
+"x" in the top-right corner, or press Esc.  A deliberate close exits with code
+0 and the supervisor leaves the face closed instead of relaunching it.
+
 Run:
   DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
     .venv/bin/python scripts/face_display.py --monitor 1
@@ -217,7 +221,12 @@ def load_envelope(path, rate=50.0):
 
 
 class FaceWindow:
-    def __init__(self, root, w, h, fps=33, debug=False):
+    # Touch-friendly control: 44 px circle, plus a few px of slop so it is easy
+    # to hit on the laptop touchscreen.
+    CLOSE_R = 22
+    CLOSE_SLOP = 8
+
+    def __init__(self, root, w, h, fps=33, debug=False, close_button=True):
         import tkinter as tk
         self.tk = tk
         self.root = root
@@ -226,7 +235,6 @@ class FaceWindow:
                             highlightthickness=0, bd=0)
         self.cv.pack(fill="both", expand=True)
         self.w, self.h = w, h
-        self.cv.bind("<Configure>", self._resize)
         self.next_blink = time.time() + random.uniform(2.0, 5.0)
         self.blink_start = 0.0
 
@@ -248,11 +256,58 @@ class FaceWindow:
             w / 2, h * 0.94, text="", fill=FACE_DIM,
             font=("DejaVu Sans", 12), state="normal" if debug else "hidden")
 
-        self.root.bind("<Escape>", lambda e: self.root.destroy())
+        # The window is overrideredirect (no title bar), so it owns its close
+        # control.  Draw it last so it sits above every face element.
+        self.close_enabled = close_button
+        hidden = "normal" if close_button else "hidden"
+        self.close_ring = self.cv.create_oval(
+            0, 0, 0, 0, outline=FACE_DIM, width=2, state=hidden)
+        self.close_x = self.cv.create_text(
+            0, 0, text="✕", fill=FACE_DIM, font=("DejaVu Sans", 16), state=hidden)
+        self.close_cx, self.close_cy = w - 34, 34
+        self._layout_close()
+
+        self.cv.bind("<Button-1>", self._on_click)
+        self.cv.bind("<Motion>", self._on_motion)
+        self.cv.bind("<Configure>", self._resize)
+        self.root.bind("<Escape>", lambda e: self.close())
         self.root.after(200, self.tick)
+
+    def _layout_close(self):
+        cx, cy, r = self.w - 34, 34, self.CLOSE_R
+        self.close_cx, self.close_cy = cx, cy
+        self.cv.coords(self.close_ring, cx - r, cy - r, cx + r, cy + r)
+        self.cv.coords(self.close_x, cx, cy)
+
+    def _in_close(self, ev):
+        dx = ev.x - self.close_cx
+        dy = ev.y - self.close_cy
+        reach = self.CLOSE_R + self.CLOSE_SLOP
+        return dx * dx + dy * dy <= reach * reach
+
+    def _on_motion(self, ev):
+        if not self.close_enabled:
+            return
+        hot = self._in_close(ev)
+        self.cv.itemconfig(self.close_ring, outline=FACE if hot else FACE_DIM)
+        self.cv.itemconfig(self.close_x, fill=FACE if hot else FACE_DIM)
+
+    def _on_click(self, ev):
+        if self.close_enabled and self._in_close(ev):
+            self.close()
+
+    def close(self):
+        """Close deliberately: exit 0 so the supervisor leaves the face closed."""
+        print("face display closing", flush=True)
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def _resize(self, ev):
         self.w, self.h = max(320, ev.width), max(240, ev.height)
+        if hasattr(self, "close_ring"):
+            self._layout_close()
 
     def tick(self):
         now = time.time()
@@ -350,6 +405,8 @@ def main():
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--debug", action="store_true",
                     help="show the emotion name on screen")
+    ap.add_argument("--no-close-button", action="store_true",
+                    help="hide the on-screen close control (Esc still works)")
     ap.add_argument("--list-monitors", action="store_true")
     args = ap.parse_args()
 
@@ -381,7 +438,8 @@ def main():
     else:
         root.geometry("1200x800")
         w, h = 1200, 800
-    FaceWindow(root, w, h, debug=args.debug)
+    FaceWindow(root, w, h, debug=args.debug,
+               close_button=not args.no_close_button)
     print(f"face on {geo or 'window'} | http://127.0.0.1:{args.port}", flush=True)
     root.mainloop()
     return 0

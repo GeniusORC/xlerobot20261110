@@ -45,6 +45,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from config_loader import CFG
 SOFTWARE = os.path.join(ROOT, "XLeRobot", "software")
 EXAMPLE = os.path.join(
     SOFTWARE, "examples", "7_xlerobot_2wheels_teleop_joycon.py")
@@ -55,11 +57,11 @@ if SOFTWARE not in sys.path:
     sys.path.insert(0, SOFTWARE)
 
 # Measured on this build (see docs/setup.md).
-WHEEL_RADIUS = 0.0635
-WHEELBASE = 0.414
+WHEEL_RADIUS = CFG["robot"]["wheel_radius_m"]
+WHEELBASE = CFG["robot"]["wheelbase_m"]
 ROBOT_ID = "xlerobot"
-PORT1 = "/dev/xlerobot_serial_b"   # left arm + head
-PORT2 = "/dev/xlerobot_serial_a"   # right arm + wheels
+PORT1 = CFG["motors"]["port_bus1"]
+PORT2 = CFG["motors"]["port_bus2"]
 
 
 def check_hidraw():

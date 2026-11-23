@@ -30,11 +30,12 @@ from collections import deque
 
 import numpy as np
 import requests
+from config_loader import service_url, CFG
 
 import face_client as face
 import vision_context as v
 
-ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090").rstrip("/")
+ROBOT_API = service_url("robot_api")
 
 # Measured on this head: +dpan turns the camera right, -dtilt tilts it up.
 PAN_SIGN = -1.0
@@ -337,7 +338,7 @@ def main():
                     help="seconds without a face before sweeping to look for one")
     ap.add_argument("--follow", action="store_true",
                     help="let the base follow the person, holding --standoff")
-    ap.add_argument("--standoff", type=float, default=1.0,
+    ap.add_argument("--standoff", type=float, default=CFG["robot"]["follow_standoff_m"],
                     help="metres to hold from the person's face (default 1.0)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()

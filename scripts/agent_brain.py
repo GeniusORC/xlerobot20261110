@@ -22,6 +22,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime
 
 import requests
@@ -34,6 +35,15 @@ CHAT_DB = os.path.join(CHAT_DIR, "chat.db")
 MAX_HISTORY = 10
 MAX_FACTS = 12
 LLM_TIMEOUT = 12
+LLM_LOCK = threading.Lock()
+LLM_STATE = {"ok": None, "latency_ms": None, "checked_at": None, "error": None}
+
+
+def llm_status():
+    with LLM_LOCK:
+        return {**LLM_STATE, "model": os.environ.get("LLM_MODEL", ""),
+                "base_url": os.environ.get("LLM_BASE_URL", ""),
+                "configured": bool(os.environ.get("LLM_BASE_URL") and os.environ.get("LLM_MODEL"))}
 
 # ---------------------------------------------------------------------------
 # Tools the model may call.  The names are stable: voice_web.handle_action()
@@ -229,10 +239,21 @@ def _post(messages, tools=None, temperature=0.5, max_tokens=300,
         body["tool_choice"] = "auto"
     if response_format:
         body["response_format"] = response_format
-    r = requests.post(f"{base}/chat/completions", headers=headers,
-                      json=body, timeout=LLM_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    started = time.monotonic()
+    try:
+        r = requests.post(f"{base}/chat/completions", headers=headers,
+                          json=body, timeout=LLM_TIMEOUT)
+        r.raise_for_status()
+        result = r.json()
+        with LLM_LOCK:
+            LLM_STATE.update(ok=True, error=None, checked_at=time.time(),
+                             latency_ms=round((time.monotonic() - started) * 1000))
+        return result
+    except Exception as exc:
+        with LLM_LOCK:
+            LLM_STATE.update(ok=False, error=type(exc).__name__, checked_at=time.time(),
+                             latency_ms=round((time.monotonic() - started) * 1000))
+        raise
 
 
 def build_messages(text: str, history=None, context=None) -> list:

@@ -32,8 +32,9 @@ import agent_brain
 import face_client as face
 import vision_context
 from voice_loop import tts, transcribe, vad_trim
+from config_loader import service_url
 
-ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090")
+ROBOT_API = service_url("robot_api")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_DIR = os.path.join(ROOT, "data", "audio")
 os.makedirs(AUDIO_DIR, exist_ok=True)

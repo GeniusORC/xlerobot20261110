@@ -20,11 +20,15 @@ import tempfile
 import threading
 import time
 import traceback
+import json
+import shlex
+from pathlib import Path
 from collections import deque
 from datetime import datetime
 
 import numpy as np
 import requests
+from config_loader import CFG, service_url
 import soundfile as sf
 import torch
 from flask import Flask, jsonify, request
@@ -32,6 +36,11 @@ from flask import Flask, jsonify, request
 import face_client as face
 import voice_web as vw
 from control_page import HTML as CONTROL_HTML
+import agent_brain
+from config_loader import CFG, project_path, service_url
+
+TRACE_LOCK = threading.Lock()
+LAST_TRACE = {}
 
 CAPTURE_DEV = os.environ.get("CAPTURE_DEV", "default")
 PLAYBACK_DEV = os.environ.get("PLAYBACK_DEV", "default")
@@ -178,7 +187,14 @@ def process_text(text):
     text = (text or "").strip()
     if not text:
         return None
+    started = time.monotonic()
     out = vw.route_text(text)
+    with TRACE_LOCK:
+        LAST_TRACE.clear()
+        LAST_TRACE.update(text=text, engine=out.get("engine"), action=out.get("intent"),
+                          result=out.get("robot", out.get("reply")),
+                          elapsed_ms=round((time.monotonic() - started) * 1000),
+                          created_at=datetime.now().isoformat(timespec="seconds"))
     add_message("user", text)
     reply = out.get("reply", "")
     if reply:
@@ -352,6 +368,9 @@ def api_status():
     st = vw.robot_status()
     st["listening"] = LISTEN_ENABLED.is_set()
     st["paused"] = LISTEN_PAUSED.is_set()
+    st["llm"] = agent_brain.llm_status()
+    with TRACE_LOCK:
+        st["trace"] = dict(LAST_TRACE)
     return jsonify(st)
 
 
@@ -360,18 +379,20 @@ def api_health():
     """Check health of all 5 services for the control panel status bar."""
     out = {}
     services = [
-        ("robot_api", "http://127.0.0.1:8090/status"),
-        ("camera_web", "http://127.0.0.1:8080/"),
-        ("health_web", "http://127.0.0.1:8084/"),
-        ("face_web", "http://127.0.0.1:8086/state"),
+        ("robot_api", service_url("robot_api") + "/status"),
+        ("camera_web", service_url("camera_web") + "/health"),
+        ("health_web", service_url("health_web") + "/"),
+        ("face_web", service_url("face_web") + "/state"),
     ]
     for name, url in services:
         try:
             r = requests.get(url, timeout=1.5)
             out[name] = {"ok": r.ok, "code": r.status_code}
+            if name == "robot_api" and r.ok:
+                out[name]["ok"] = r.json().get("connected") is True
         except Exception as e:
             out[name] = {"ok": False, "error": str(e)[:80]}
-    out["voice_web"] = {"ok": True}  # self
+    out["voice_web"] = {"ok": vw.ASR is not None and vw.VAD is not None}
     return jsonify(out)
 
 
@@ -400,23 +421,59 @@ def api_robot(sub):
 @app.get("/api/logs/<name>")
 def api_logs(name):
     """Return the last N lines of a log file for the control panel log viewer."""
-    allowed = {"robot_api", "camera_web", "voice_auto", "health_station", "face_display", "head_track", "watchdog"}
+    aliases = {"voice_auto": "voice_auto_web", "health_station": "health_station_web"}
+    name = aliases.get(name, name)
+    allowed = {"robot_api", "camera_web", "voice_auto_web", "health_station_web", "face_display", "head_track", "watchdog"}
     if name not in allowed:
         return jsonify({"error": "unknown log"}), 400
 
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "logs")
+    log_dir = project_path(os.environ.get("LOG", CFG["logs"]["dir"]))
     path = os.path.join(log_dir, f"{name}.log")
-
-    if not os.path.exists(path):
-        return jsonify({"lines": [], "exists": False})
-
     try:
-        n = min(int(request.args.get("lines", 50)), 200)
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        n = int(request.args.get("lines", 50))
+        if not 1 <= n <= 200:
+            return jsonify({"error": "lines must be 1..200"}), 400
+        if not os.path.exists(path):
+            return jsonify({"lines": [], "exists": False})
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", errors="replace").splitlines(keepends=True)
         return jsonify({"lines": lines[-n:], "exists": True})
+    except ValueError:
+        return jsonify({"error": "lines must be 1..200"}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}, exists=True), 500
+        return jsonify({"error": type(e).__name__, "exists": True}), 500
+
+
+@app.route("/api/llm/config", methods=["GET", "POST"])
+def api_llm_config():
+    if request.method == "GET":
+        return jsonify(agent_brain.llm_status())
+    data = request.get_json(silent=True) or {}
+    base = str(data.get("base_url", "")).rstrip("/")
+    model = str(data.get("model", "")).strip()
+    from urllib.parse import urlparse
+    parsed = urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or not model or any(c in base + model for c in "\r\n"):
+        return jsonify({"error": "valid HTTP URL and model required"}), 400
+    values = {"LLM_BASE_URL": base, "LLM_MODEL": model}
+    api_key = data.get("api_key")
+    values["LLM_API_KEY"] = (str(api_key) if api_key is not None
+                              else os.environ.get("LLM_API_KEY", ""))
+    path = Path.home() / ".config/xlerobot/llm.env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with agent_brain.LLM_LOCK:
+        with open(tmp, "w", encoding="utf-8", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+            for key, value in values.items():
+                f.write(f"export {key}={shlex.quote(value)}\n")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.environ.update(values)
+        agent_brain.LLM_STATE.update(ok=None, checked_at=None, error=None)
+    return jsonify({"ok": True})
 
 
 HTML = r"""<!doctype html>
@@ -442,6 +499,7 @@ img{width:100%;background:#000;border-radius:8px;margin-top:8px}
 small{color:#888}
 .camwrap{display:none}.camwrap.on{display:block}
 .camsw{font-size:13px;padding:8px 11px;margin:2px}
+.settings{margin-top:10px;padding-top:8px;border-top:1px solid #444}
 </style></head><body>
 <h1>XLeRobot 养老陪伴 <small>· 自动语音</small>
   <a href="/control" style="font-size:13px;font-weight:400;color:#7ab;margin-left:10px">控制台 →</a></h1>
@@ -465,6 +523,11 @@ small{color:#888}
       <span id="listenState">🎧 自动监听中，直接说话即可</span>
     </div>
     <div id="status">robot: ...</div>
+    <div id="llmStatus">LLM: ...</div>
+    <details class="settings"><summary>LLM 设置</summary>
+      <div class="row"><input id="llmBase" placeholder="https://api.example.com/v1"><input id="llmModel" placeholder="模型名"></div>
+      <div class="row"><input id="llmKey" type="password" placeholder="API key（留空保持不变）"><button onclick="saveLlm()">保存</button></div>
+    </details>
   </div>
   <div class="card">
     <strong>实时相机</strong>
@@ -529,7 +592,22 @@ async function pollStatus(){
   try{
     const r=await fetch('/api/status'); const j=await r.json();
     document.getElementById('status').textContent='robot: '+JSON.stringify(j);
+    const llm=j.llm||{};
+    document.getElementById('llmStatus').textContent = !llm.configured ? 'LLM: 未配置' :
+      llm.ok===true ? `LLM: ${llm.model} · ${llm.latency_ms} ms` :
+      llm.ok===false ? `LLM: 离线 (${llm.error})` : `LLM: ${llm.model} · 尚未检测`;
+    document.getElementById('llmBase').value ||= llm.base_url || '';
+    document.getElementById('llmModel').value ||= llm.model || '';
   }catch(e){ document.getElementById('status').textContent='robot: offline'; }
+}
+async function saveLlm(){
+  const body={base_url:document.getElementById('llmBase').value,model:document.getElementById('llmModel').value};
+  const key=document.getElementById('llmKey').value;if(key) body.api_key=key;
+  const r=await fetch('/api/llm/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const result=await r.json();
+  document.getElementById('llmKey').value='';
+  document.getElementById('llmStatus').textContent=result.ok?'LLM 配置已保存':'保存失败: '+(result.error||'未知错误');
+  pollStatus();
 }
 setInterval(pollMsgs,700);
 setInterval(pollStatus,2000);
@@ -549,6 +627,7 @@ def main():
     args = ap.parse_args()
     CAPTURE_DEV = args.capture_dev
     PLAYBACK_DEV = args.playback_dev
+    vw.ROBOT_API = service_url("robot_api")
 
     vw.load_models()
     init_chat_db()

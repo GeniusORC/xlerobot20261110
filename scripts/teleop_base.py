@@ -17,6 +17,7 @@ import time
 import traceback
 
 from pynput import keyboard
+from config_loader import CFG
 
 from lerobot_robot_xlerobot_2wheels import XLerobot2Wheels, XLerobot2WheelsConfig
 
@@ -82,11 +83,11 @@ def connect_robot(cfg):
 
 def main() -> int:
     cfg = XLerobot2WheelsConfig(
-        port1="/dev/xlerobot_serial_b",
-        port2="/dev/xlerobot_serial_a",
+        port1=CFG["motors"]["port_bus1"],
+        port2=CFG["motors"]["port_bus2"],
         id="xlerobot",
-        wheel_radius=0.0635,
-        wheelbase=0.414,
+        wheel_radius=CFG["robot"]["wheel_radius_m"],
+        wheelbase=CFG["robot"]["wheelbase_m"],
     )
     robot = connect_robot(cfg)
     if robot is None:

@@ -10,6 +10,7 @@ before starting this server, or use a separate process for robot recording.
 """
 import argparse
 import io
+import json
 import os
 import threading
 import time
@@ -42,7 +43,7 @@ WRIST_PATHS = {
         "/dev/v4l/by-path/" + _CFG["cameras"]["wrist_right_path"],
     ],
 }
-_D455_RESETS = 3        # hardware-reset attempts before giving up
+_D455_RESETS = 3        # consecutive failures before a hardware reset
 _D455_RESET_WAIT = 9.0  # seconds between reset and re-open
 
 
@@ -70,6 +71,7 @@ class OpenCVCamera:
         self.fps = fps
         self.cap = None
         self.jpeg = None
+        self.updated = 0.0
         self.error = None
         self.lock = threading.Lock()
         self.stop = False
@@ -88,18 +90,23 @@ class OpenCVCamera:
                 self.cap.set(cv2.CAP_PROP_FPS, self.fps)
                 if not self.cap.isOpened():
                     self.error = f"cannot open {self.dev}"
+                    self.cap.release()
+                    self.cap = None
                     time.sleep(1)
                     continue
                 self.error = None
             ok, frame = self.cap.read()
             if not ok or frame is None:
                 self.error = "read failed"
+                self.cap.release()
+                self.cap = None
                 time.sleep(0.2)
                 continue
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with self.lock:
                     self.jpeg = buf.tobytes()
+                    self.updated = time.monotonic()
                     self.error = None
             time.sleep(max(0.0, 1.0 / self.fps - 0.005))
 
@@ -122,6 +129,7 @@ class RealSenseHead:
         self.align = rs.align(rs.stream.color) if rs is not None else None
         self.jpeg = None
         self.depth_jpeg = None
+        self.updated = 0.0
         self.depth = None          # raw aligned depth, uint16 millimetres
         self.depth_scale = 0.001   # metres per depth unit
         self.K = None              # (fx, fy, cx, cy) of the aligned color stream
@@ -129,6 +137,7 @@ class RealSenseHead:
         self.lock = threading.Lock()
         self.stop = False
         self._fail_count = 0   # consecutive open failures; triggers hw reset
+        self._reset_count = 0
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def start(self):
@@ -169,6 +178,7 @@ class RealSenseHead:
                     if ok:
                         with self.lock:
                             self.jpeg = buf.tobytes()
+                            self.updated = time.monotonic()
                 if depth:
                     # Keep the raw aligned depth so clients can convert pixels to
                     # metres; the colourised JPEG is only for the web view.
@@ -182,6 +192,7 @@ class RealSenseHead:
                             self.depth_jpeg = buf.tobytes()
                 self.error = None
                 self._fail_count = 0  # success: reset the counter
+                self._reset_count = 0
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
                 self._fail_count += 1
@@ -191,21 +202,30 @@ class RealSenseHead:
                 except Exception:
                     pass
                 self.pipe = None
+                with self.lock:
+                    self.jpeg = self.depth_jpeg = self.depth = None
                 # After _D455_RESETS consecutive failures, try hardware_reset().
                 if self._fail_count >= _D455_RESETS:
-                    print(f"D455: {self._fail_count} consecutive failures, attempting hardware_reset…", flush=True)
+                    if self._reset_count >= _D455_RESETS:
+                        print("D455: hardware reset limit reached; retrying open with backoff", flush=True)
+                        time.sleep(15)
+                        continue
+                    print(f"D455: {self._fail_count} consecutive failures, attempting hardware_reset ({self._reset_count + 1}/{_D455_RESETS})…", flush=True)
                     try:
                         ctx = rs.context()
                         for dev in ctx.devices:
                             if dev.get_info(rs.camera_info.serial_number) == self.serial:
                                 dev.hardware_reset()
+                                self._reset_count += 1
                                 print("D455: hardware_reset() issued, waiting for re-enumeration…", flush=True)
                                 self._fail_count = 0  # reset after hw reset attempt
                                 time.sleep(_D455_RESET_WAIT)
                                 break
+                        else:
+                            time.sleep(15)
                     except Exception as reset_err:
                         print(f"D455: hardware_reset failed: {reset_err}", flush=True)
-                        time.sleep(2)
+                        time.sleep(15)
                 else:
                     time.sleep(1)
 
@@ -273,6 +293,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/health":
+            cameras = {name: {"ok": cam.error is None and time.monotonic() - cam.updated < 3,
+                              "error": cam.error}
+                       for name, cam in self.cameras.items()}
+            ok = bool(cameras) and all(cam["ok"] for cam in cameras.values())
+            blob = json.dumps({"ok": ok, "cameras": cameras}).encode()
+            self.send_response(200 if ok else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            return
         if path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -352,15 +384,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--head-serial", default=HEAD_D455_SERIAL)
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--width", type=int, default=_CFG["cameras"]["head_width"])
+    ap.add_argument("--height", type=int, default=_CFG["cameras"]["head_height"])
+    ap.add_argument("--fps", type=int, default=_CFG["cameras"]["head_fps"])
     args = ap.parse_args()
 
     head = RealSenseHead(args.head_serial, args.width, args.height, args.fps)
     cams = {"head": head}
     for name, dev in WRISTS.items():
-        cams[name] = OpenCVCamera(name, dev, args.width, args.height, args.fps)
+        cams[name] = OpenCVCamera(name, dev, _CFG["cameras"]["wrist_width"],
+                                 _CFG["cameras"]["wrist_height"], _CFG["cameras"]["wrist_fps"])
     Handler.cameras = cams
     Handler.head = head
     for cam in cams.values():

@@ -27,6 +27,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from scipy.signal import find_peaks
+from config_loader import CFG, service_url
 
 import matplotlib
 matplotlib.use("Agg")
@@ -37,8 +38,8 @@ HEALTH_DIR = os.path.join(ROOT, "data", "health")
 os.makedirs(HEALTH_DIR, exist_ok=True)
 DB_PATH = os.path.join(HEALTH_DIR, "health.db")
 MODEL = os.path.join(ROOT, "models", "pose_landmarker_lite.task")
-ROBOT_API = os.environ.get("ROBOT_API", "http://127.0.0.1:8090")
-DEFAULT_SOURCE = "http://127.0.0.1:8080/snapshot/head"
+ROBOT_API = service_url("robot_api")
+DEFAULT_SOURCE = service_url("camera_web") + "/snapshot/head"
 
 app = Flask(__name__)
 
@@ -1239,6 +1240,9 @@ def init_db():
             step_count INTEGER,
             cadence REAL,
             symmetry REAL,
+            distance_m REAL,
+            step_length_m REAL,
+            depth INTEGER,
             risk TEXT,
             metrics TEXT,
             report TEXT,
@@ -1494,6 +1498,32 @@ def api_history():
     return jsonify({"sessions": [row_to_latest(r) for r in rows]})
 
 
+@app.get("/history")
+def history_page():
+    return HISTORY_HTML
+
+
+@app.get("/api/history/trend")
+def api_history_trend():
+    days = min(max(request.args.get("days", default=30, type=int), 1), 365)
+    init_db()
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT ts, step_length_m, risk FROM sessions "
+            "WHERE step_length_m IS NOT NULL ORDER BY ts DESC LIMIT 200"
+        ).fetchall()
+    values = [dict(ts=r["ts"], step_length_m=r["step_length_m"], risk=r["risk"])
+              for r in reversed(rows)]
+    if values:
+        try:
+            cutoff = time.time() - days * 86400
+            values = [v for v in values if datetime.fromisoformat(v["ts"]).timestamp() >= cutoff]
+        except ValueError:
+            pass
+    return jsonify({"sessions": values})
+
+
 @app.get("/api/session/<int:sid>")
 def api_session(sid):
     with sqlite3.connect(DB_PATH) as db:
@@ -1568,7 +1598,7 @@ h3{margin:14px 0 6px;font-size:15px;color:#ddd}
     <div id="follow_msg" style="font-size:13px;color:#9c9;margin:6px 0"></div>
     <div id="bar"><div id="fill"></div></div>
     <div id="msg">请让老人站在头部相机前，露出全身；距离 2–3 米。</div>
-    <img id="live" src="http://127.0.0.1:8080/stream/head">
+    <img id="live" src="">
     <small>实时头部相机 D455（彩色 + 对齐深度）</small>
     <table id="metrics">
       <tr><td>状态</td><td id="m_status">未开始</td></tr>
@@ -1684,6 +1714,11 @@ let pollTimer=null;
 async function poll(){
   try{
     const r=await fetch('/api/status'); const j=await r.json();
+    const live=document.getElementById('live');
+    if(!live.src || live.dataset.ready!=='1'){
+      live.src=(j.source||'http://127.0.0.1:8080/stream/head').replace('/snapshot/head','/stream/head');
+      live.dataset.ready='1';
+    }
     document.getElementById('fill').style.width=Math.round((j.progress||0)*100)+'%';
     if(j.error) document.getElementById('msg').textContent=j.error;
     if(j.track_message) document.getElementById('track_msg').textContent=j.track_message;
@@ -1707,6 +1742,31 @@ async function poll(){
 poll(); loadHistory();
 </script></body></html>
 """
+
+
+HISTORY_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>步态历史</title><style>
+body{font:15px system-ui;background:#151719;color:#edf0f1;margin:20px}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px}a{color:#89c7b2}
+table{border-collapse:collapse;width:100%;margin-top:18px}td,th{text-align:left;border-bottom:1px solid #444;padding:9px}
+canvas{width:min(100%,900px);height:320px;background:#202326;margin-top:16px}
+</style></head><body><header><h1>步态记录</h1><a href="/">返回健康站</a></header>
+<label>显示天数 <select id="days"><option>7</option><option selected>30</option><option>90</option><option>365</option></select></label>
+<canvas id="trend" width="900" height="320"></canvas>
+<table><thead><tr><th>时间</th><th>步长</th><th>风险</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+async function load(){
+ const data=await (await fetch('/api/history/trend?days='+document.getElementById('days').value)).json();
+ const rows=data.sessions||[], canvas=document.getElementById('trend'), ctx=canvas.getContext('2d');
+ ctx.clearRect(0,0,canvas.width,canvas.height); ctx.strokeStyle='#78c6a3'; ctx.lineWidth=3;
+ const vals=rows.map(x=>Number(x.step_length_m)), max=Math.max(0.2,...vals), min=Math.min(0,...vals);
+ if(vals.length){ctx.beginPath(); vals.forEach((v,i)=>{const x=30+i*(canvas.width-60)/Math.max(1,vals.length-1), y=canvas.height-30-(v-min)/(max-min||1)*(canvas.height-60); i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}
+ const body=document.getElementById('rows'); body.replaceChildren();
+ for(const item of rows.slice().reverse()){const tr=document.createElement('tr');for(const val of [item.ts,item.step_length_m+' m',item.risk]){const td=document.createElement('td');td.textContent=val;tr.appendChild(td)}body.appendChild(tr)}
+}
+document.getElementById('days').addEventListener('change',load);load();
+</script></body></html>"""
 
 
 def main():

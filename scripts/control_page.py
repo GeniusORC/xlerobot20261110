@@ -68,6 +68,8 @@ tr.sel td{background:#233247}
 <h1>XLeRobot 控制台 <a href="/">← 回到陪伴页面</a></h1>
 <div id="status">连接中...</div>
 <div id="health" style="font-size:12px;color:var(--dim);margin-top:6px"></div>
+<div id="llmStatus" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
+<div id="trace" style="font-size:12px;color:var(--dim);margin-top:4px"></div>
 
 <div class="grid" style="margin-top:12px">
 
@@ -144,7 +146,7 @@ tr.sel td{background:#233247}
       </select></label>
       <button class="go" onclick="replayPose()">执行</button>
     </div>
-    <p class="hint" id="armHint">夹爪控制假设扭矩已开启。姿态快照保存到浏览器本地存储。</p>
+    <p class="hint" id="armHint">夹爪扭矩保持开启；停止键会中断当前轨迹。</p>
   </div>
 
   <div class="card wide">
@@ -176,6 +178,7 @@ tr.sel td{background:#233247}
 
   <div class="card wide">
     <h2>日志查看器</h2>
+    <p class="hint"><a href="http://127.0.0.1:8084/history" target="_blank" rel="noopener">打开步态历史趋势</a></p>
     <div class="row">
       <label>服务 <select id="logSelect" onchange="loadLog()">
         <option value="robot_api">robot_api</option>
@@ -266,6 +269,13 @@ async function poll(){
   if (s.follow_client) pills.push('<span class="pill">跟随客户端在线</span>');
   pills.push('<span class="pill">' + (s.message || '') + '</span>');
   $('status').innerHTML = pills.join('');
+  if (s.llm) {
+    const label = !s.llm.configured ? 'LLM 未配置' :
+      s.llm.ok === true ? `LLM ${s.llm.model} ${s.llm.latency_ms ?? '?'} ms` :
+      s.llm.ok === false ? `LLM 离线: ${s.llm.error}` : `LLM ${s.llm.model} 尚未检测`;
+    $('llmStatus').textContent = label + ' · ' + (s.trace?.engine || '尚无最近指令');
+    $('trace').textContent = s.trace?.text ? `最近输入: ${s.trace.text} · ${s.trace.action || ''} · ${s.trace.elapsed_ms} ms` : '';
+  }
   $('followBtn').textContent = '跟随：' + (s.follow ? '开' : '关');
   $('followBtn').classList.toggle('on', !!s.follow);
   $('followHint').textContent = s.follow_client ? 'head_track.py 正在发送心跳'
@@ -277,7 +287,8 @@ async function poll(){
 }
 
 async function pollHealth(){
-  const h = await j('GET','/health');
+  let h;
+  try { h = await (await fetch('/api/health')).json(); } catch (_) { return; }
   if (!h) return;
   const dots = [];
   const names = {robot_api:'机器人',camera_web:'摄像头',voice_web:'语音',health_web:'健康',face_web:'表情'};
@@ -402,6 +413,7 @@ async function changeId(){
 /* ---------------- arms ---------------- */
 
 async function gripper(arm, open){
+  if (!confirm(`${arm === 'left' ? '左' : '右'}夹爪将${open ? '打开' : '关闭'}。确认周围安全？`)) return;
   const r = await j('POST','/arm/gripper', {arm, open});
   if (r && r.ok) toast(`${arm === 'left' ? '左' : '右'}夹爪已${open ? '打开' : '关闭'}`);
 }
@@ -409,11 +421,10 @@ async function gripper(arm, open){
 async function snapshotPose(){
   const r = await j('GET','/arm/state');
   if (!r || r.error) { toast('读取姿态失败', true); return; }
-  const name = prompt('姿态名称 (例如: home, grasp, handoff):');
+  const name = prompt('姿态名称 (仅字母、数字、_、-):');
   if (!name) return;
-  const poses = JSON.parse(localStorage.getItem('xlerobot_poses') || '{}');
-  poses[name] = {left: r.left, right: r.right, ts: Date.now()};
-  localStorage.setItem('xlerobot_poses', JSON.stringify(poses));
+  const saved = await j('POST', '/arm/poses/' + encodeURIComponent(name), {});
+  if (!saved?.ok) { toast(saved?.error || '保存姿态失败', true); return; }
   loadPoses();
   toast('已保存姿态: ' + name);
 }
@@ -421,24 +432,18 @@ async function snapshotPose(){
 async function replayPose(){
   const sel = $('poseSelect').value;
   if (!sel) { toast('请选择一个姿态', true); return; }
-  const poses = JSON.parse(localStorage.getItem('xlerobot_poses') || '{}');
-  const pose = poses[sel];
-  if (!pose) { toast('姿态不存在', true); return; }
-  
-  for (const arm of ['left', 'right']){
-    if (pose[arm] && !pose[arm].error){
-      const r = await j('POST','/arm/pose', {arm, pose: pose[arm], duration_s: 2.0});
-      if (!r || !r.ok) { toast(`${arm}臂执行失败`, true); return; }
-    }
-  }
+  if (!confirm(`将执行姿态 ${sel}。请确认机械臂周围无人且运行区域安全。`)) return;
+  const r = await j('POST', '/arm/poses/' + encodeURIComponent(sel) + '/replay', {});
+  if (!r?.ok) { toast(r?.error || '姿态执行失败', true); return; }
   toast('姿态已执行: ' + sel);
 }
 
 function loadPoses(){
-  const poses = JSON.parse(localStorage.getItem('xlerobot_poses') || '{}');
-  const sel = $('poseSelect');
-  sel.innerHTML = '<option value="">-- 选择姿态 --</option>' +
-    Object.keys(poses).sort().map(k => `<option value="${k}">${k}</option>`).join('');
+  j('GET', '/arm/poses').then(r => {
+    const sel = $('poseSelect');
+    sel.innerHTML = '<option value="">-- 选择姿态 --</option>' +
+      (r?.poses || []).map(k => `<option value="${k}">${k}</option>`).join('');
+  });
 }
 
 /* ---------------- logs ---------------- */

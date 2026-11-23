@@ -1,0 +1,16 @@
+[Unit]
+Description=XLeRobot companion stack supervisor
+After=network.target graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/xlerobot
+ExecStart=/bin/bash @ROOT@/scripts/systemd_start.sh
+ExecStop=@ROOT@/.venv/bin/python scripts/demo_manager.py stop
+Restart=no
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

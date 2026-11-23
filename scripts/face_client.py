@@ -6,8 +6,9 @@ Every call is best-effort: if the face is not running the robot still talks.
 import os
 
 import requests
+from config_loader import service_url
 
-FACE_API = os.environ.get("FACE_API", "http://127.0.0.1:8086").rstrip("/")
+FACE_API = service_url("face_web")
 
 
 def _post(path, payload, timeout=0.6):
