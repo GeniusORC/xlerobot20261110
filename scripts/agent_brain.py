@@ -297,6 +297,28 @@ def has_motion_words(text: str) -> bool:
     return any(k in (text or "") for k in MOTION_WORDS)
 
 
+# Markers that the motion word is part of a story rather than an instruction.
+# Conservative by design: they only suppress a tool call, never enable one, so
+# a real short command ("跟着我", "后退") is unaffected.
+NARRATION_MARKERS = ("我孙子", "我昨天", "的时候", "看到你", "我能", "你能",
+                     "我女儿", "我儿子", "讲个", "我有点", "我年轻")
+
+
+def is_direct_command(text: str) -> bool:
+    """True when a motion tool call is plausibly an instruction to the robot.
+
+    Mirrors the contract given to the LLM: tools are reserved for short,
+    explicit requests.  Long sentences or those containing narration markers
+    are treated as conversation even if a motion word is present.
+    """
+    t = (text or "").strip().strip("。！!，,.?？ ")
+    if not t:
+        return False
+    if any(k in t for k in NARRATION_MARKERS):
+        return False
+    return len(t) <= 10 and has_motion_words(t)
+
+
 def chat_only(text: str, history=None, context=None):
     """Plain completion without tools, used when a tool call misfires."""
     try:

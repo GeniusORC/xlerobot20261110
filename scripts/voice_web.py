@@ -86,8 +86,13 @@ def load_models():
 
 def map_intent(text: str) -> str:
     t = (text or "").lower()
-    if any(k in t for k in ("停下", "停止", "停住", "别动", "不要动")):
-        return "stop"
+    # Metaphorical "stop" ("can you stop and listen") must not halt the base.
+    # Only short imperative stop phrases count as a robot stop command.
+    stop_words = ("停下", "停止", "停住", "别动", "不要动")
+    if any(k in t for k in stop_words):
+        head = t.strip("。！!，,.?？ ")
+        if len(head) <= 8:
+            return "stop"
     if any(k in t for k in ("看我", "看着我", "面向我", "转过来", "看看我")):
         return "look"
     if any(k in t for k in ("左转", "向左转", "往左转")):
@@ -395,8 +400,8 @@ def route_text(text: str) -> dict:
                 "mode": "chat"}
 
     action = decision["action"]
-    if action in ("move_robot", "come_here", "look_at_me", "follow_me") \
-            and not agent_brain.has_motion_words(text):
+    if action in ("move_robot", "come_here", "look_at_me", "follow_me", "stop_robot") \
+            and not agent_brain.is_direct_command(text):
         # The model sometimes latches onto an earlier robot turn and calls a
         # movement tool while the user is just talking.  Re-ask without tools.
         retry = agent_brain.chat_only(text, CHAT_HISTORY, context=vision)
