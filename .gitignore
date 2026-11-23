@@ -8,6 +8,8 @@ __pycache__/
 *.wav
 *.mp3
 *.png
+# keep the committed architecture diagrams
+!docs/images/*.png
 .pytest_cache/
 
 # Sensitive / large local files

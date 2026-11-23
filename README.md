@@ -19,6 +19,28 @@ Working repository for the 智能养老服务领域轮式机器人关键技术�
 | `.venv-robot07` | 3.12 | LeRobot 0.7.0, XLeRobot 2-wheel plugin | Compatibility test only |
 | system | 3.12 | ROS 2 Jazzy, Nav2, RTAB-Map, realsense2_camera | Navigation / perception |
 
+## Architecture
+
+![XLeRobot system architecture (English)](docs/images/xlerobot_architecture.png)
+
+*English edition above; [中文版架构图](docs/images/xlerobot_architecture_cn.png)
+([SVG](docs/images/xlerobot_architecture_cn.svg) · [English SVG](docs/images/xlerobot_architecture.svg)).
+Sources and regeneration instructions: [`docs/images/`](docs/images/README.md).*
+
+Four layers with two cross-cutting bands:
+
+- **Application layer** — voice chat (`:8082`), health station (`:8084`),
+  camera web (`:8080`) and gamepad teleop.
+- **Localhost HTTP bus** — `robot_api.py` REST API (`:8090`); localhost-only
+  JSON over ports 8080 / 8082 / 8084 / 8086 / 8090.
+- **Service layer** — motion & arms, head tracking + base follow, D455
+  MediaPipe/depth vision, FunASR + edge-tts voice, and ROS 2 Nav2 / RTAB-Map.
+- **Hardware layer** — differential base, 2 × SO-101 arms, 360° head,
+  RealSense D455, mic/speaker (PipeWire AEC) and face display.
+- **Lifecycle (top band)** — systemd user service + `demo_manager` supervisor.
+- **In-code safety (bottom band)** — stop-keyword cut-off, follow latch with a
+  0.6 s velocity lease, the 1 m / 0.85 m / 0.55 m distance rules, and e-stop.
+
 ## Health station
 
 Desktop GUI (no port 8084):
