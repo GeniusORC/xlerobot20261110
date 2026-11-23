@@ -25,11 +25,13 @@ and starts the new one. The manager never sends wheel commands itself; base
 motion stays entirely inside head_track/robot_api and remains revocable by any
 voice "停下".
 """
+import fcntl
 import os
 import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from config_loader import CFG, project_path
@@ -39,11 +41,34 @@ RUN_DIR = project_path("data/run")
 LOG_DIR = project_path(CFG["logs"]["dir"])
 PID_FILE = RUN_DIR / "head_track.pid"
 MODE_FILE = RUN_DIR / "head_track.mode"
+LOCK_FILE = RUN_DIR / "head_track.lock"
 LOG_FILE = LOG_DIR / "head_track.log"
 
 MODES = ("head", "follow")
 # Give the tracker time to restore the head pose on shutdown before SIGKILL.
 _STOP_GRACE_S = 6.0
+
+
+@contextmanager
+def _file_lock():
+    """Serialize start/stop across threads *and* processes.
+
+    Flask runs threaded, so two rapid POST /api/track calls (or a web click
+    racing a voice command) can enter start() together. Each caller opens its
+    own file descriptor, so this advisory flock genuinely contends (a shared
+    fd would be re-entrant) and makes the check-then-spawn critical section
+    atomic. The lock file lives under gitignored data/run.
+    """
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    fh = LOCK_FILE.open("a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 
 def _read_pid():
@@ -105,21 +130,25 @@ def start(mode="head", standoff=None):
     """Start the tracker in ``head`` or ``follow`` mode.
 
     Returns ``(ok, payload)``. Switching mode restarts the process; asking for
-    the already-running mode is a no-op success.
+    the already-running mode is a no-op success. Serialized by an advisory
+    file lock so concurrent requests can never spawn two trackers.
     """
     if mode not in MODES:
         return False, {"error": f"mode must be one of {MODES}"}
+    with _file_lock():
+        return _start_locked(mode, standoff)
 
+
+def _start_locked(mode, standoff):
     current = status()
     if current["running"]:
         if current["mode"] == mode:
             return True, {"already": True, **current}
-        stop()  # restart in the new mode
+        _stop_locked()  # restart in the new mode (lock already held)
 
     if not _robot_reachable():
         return False, {"error": "robot_api not connected; head servos unavailable"}
 
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     cmd = [sys.executable, str(ROOT / "scripts" / "head_track.py")]
@@ -138,6 +167,12 @@ def start(mode="head", standoff=None):
         stdout=log_fh, stderr=subprocess.STDOUT,
         start_new_session=True, env=dict(os.environ, PYTHONUNBUFFERED="1"))
 
+    # Record ownership immediately, BEFORE the liveness wait: holding the lock
+    # means no other caller can spawn, and the early PID means status() never
+    # reports a tracker that is actually running as "absent".
+    PID_FILE.write_text(str(proc.pid))
+    MODE_FILE.write_text(mode)
+
     # Wait briefly so an immediate crash (bad import, camera busy) is reported
     # instead of claiming success for a process that already exited.
     time.sleep(1.2)
@@ -146,14 +181,17 @@ def start(mode="head", standoff=None):
         return False, {"error": f"head_track exited immediately (code "
                                 f"{proc.returncode}); see {LOG_FILE}"}
 
-    PID_FILE.write_text(str(proc.pid))
-    MODE_FILE.write_text(mode)
     return True, {"running": True, "mode": mode, "pid": proc.pid,
                   "log": str(LOG_FILE.relative_to(ROOT))}
 
 
 def stop():
     """Stop the tracker and wait for its head-restore cleanup to finish."""
+    with _file_lock():
+        return _stop_locked()
+
+
+def _stop_locked():
     current = status()
     pid = current.get("pid")
     if not pid:
