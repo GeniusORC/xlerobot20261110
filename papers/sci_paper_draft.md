@@ -19,7 +19,7 @@
 
 **Methods:** The prototype is built on an XLeRobot 0.4.0 platform with three 640×480 RGB cameras and a laptop-class edge computer. The voice pipeline uses Silero VAD, SenseVoice, deterministic command routing, DeepSeek-compatible LLM chat, and echo suppression. The health station uses the MediaPipe PoseLandmarker (Tasks API) to extract 33 landmarks; knee/hip/trunk angles, cadence, symmetry, normalized step length, and sway are computed from a 10 s walk. A rule-based report and health tips are generated and persisted in SQLite.
 
-**Results:** The complete pipeline was exercised on the physical robot. Three RGB streams ran at approximately 26.5 fps each in a simultaneous test. The eight command categories (stop, come, forward, backward, turn left, turn right, look-at-me, report) were exercised successfully. Automatic speech recognition (ASR) latency was approximately 0.2–0.4 s and text-to-speech (TTS) latency approximately 1.4–1.9 s for short utterances on the edge laptop. A single 7.6 s illustrative walk produced 10 detected steps and a cadence of 79.3 steps/min; this pilot is reported only as a technical illustration, not as a clinical result. Chat and health records survived service restarts.
+**Results:** The complete pipeline was exercised on the physical robot. Three RGB streams ran at approximately 26.5 fps each in a simultaneous test. The eight command categories (stop, come, forward, backward, turn left, turn right, look-at-me, report) were exercised successfully. Automatic speech recognition (ASR) latency was approximately 0.2–0.4 s and text-to-speech (TTS) latency approximately 1.4–1.9 s for short utterances on the edge laptop, while the deterministic safety-critical routing path completed in about 0.5 ms and did not rely on the network. An offline labeled-corpus evaluation (44 utterances, three repetitions, 264 evaluations) under both a faithful and an adversarial mock model achieved 100% routing accuracy with zero safety-critical failures—no emergency utterance was missed and no conversation or narration produced an uncommanded motion, even when the model was replaced by a hostile policy. A single 7.6 s illustrative walk produced 10 detected steps and a cadence of 79.3 steps/min; this pilot and a five-session pipeline data-quality check are reported only as technical illustrations, not as clinical results. Chat and health records survived service restarts.
 
 **Conclusions:** The results support the technical feasibility of an integrated, low-cost robot for home elderly care. A controlled multi-subject study with clinical ground truth is required before any health-related efficacy claim.
 
@@ -36,9 +36,9 @@ This work asks a system-level question: **can an affordable, open, dual-arm mobi
 The contributions are:
 
 1. An integrated low-cost system that combines a differential-drive dual-arm mobile manipulator, always-on voice interaction, and an RGB gait station on one edge laptop.
-2. A dual-path language interface: deterministic, safety-first command routing for robot actions, and LLM-based companionship for open-domain conversation, with TTS echo suppression.
+2. A dual-path language interface: deterministic, safety-first command routing for robot actions, and LLM-based companionship for open-domain conversation, with TTS echo suppression and a deterministic guard that re-validates every model-proposed motion tool against imperative structure and narration markers.
 3. A 2D gait/posture pipeline with full-body visibility checks, rule-based reports, health tips, and SQLite persistence for both chat and health sessions.
-4. A preliminary physical feasibility study, including calibration observations and measured latency, with an explicit discussion of what the current evidence does and does not support.
+4. A repeatable offline evaluation harness with a labeled Chinese safety corpus, faithful and adversarial mock models, stage-latency and log-derived reliability measurements, and a preliminary physical feasibility study, all with an explicit discussion of what the current evidence does and does not support.
 
 The paper is deliberately framed as a **system and feasibility study**. The pilot involves one healthy adult and no clinical ground truth; it is not a clinical validation of gait or fall risk.
 
@@ -174,10 +174,17 @@ The web UI reads the latest session and the history table from the database; mes
 
 - The base is limited to 0.05 m/s for approach/forward/backward and 20°/s for turns in the health/voice demo.
 - A stop event preempts every motion loop; the base is stopped on idle and on disconnect.
-- Voice command routing is deterministic; the LLM has no direct motor authority.
+- Voice command routing is layered: short imperative phrases are handled by a deterministic intent mapper and safety-keyword layer *before* any model call, and the LLM has no direct motor authority.
+- A motion tool proposed by the model is re-validated by a deterministic guard (`is_direct_command`): it is accepted only when the utterance is short (at most ten characters after stripping punctuation), contains a motion word, and contains no narration marker. Sentences that merely mention motion in the first person or as a subordinate clause (e.g., "yesterday I stepped back", "turn left and watch for cars", "can you stop and listen to me") are treated as conversation and re-asked without tools. The same guard covers the stop tool, so a metaphorical "stop" cannot halt the base.
 - Emergency phrases bypass the LLM and produce fixed safety guidance.
 - Only metrics, text, and images are stored locally; no continuous audio is uploaded by default. When a cloud LLM is enabled, only the text of the conversation is sent, not video.
 - The prototype is not certified under ISO 13482 [20]; a formal risk assessment is required before unsupervised use with older adults.
+
+### 4.6 Offline routing and safety evaluation
+
+Because motion authority is the highest-risk output, command safety was evaluated offline with a labeled corpus rather than only by ad-hoc spoken tests. The corpus contains 44 Chinese utterances in seven categories—valid commands, ambiguous narration containing motion words, emergency and crisis phrases, chitchat, unanswerable factual questions, and prompt-injection attempts—each labeled with the expected routing outcome (safety bypass, stop, robot tool, conversation, or refusal of an unknown fact).
+
+The same corpus is run against two deterministic stand-in models so that the fixed safety layer can be scored independently of model quality: a **faithful** model that only calls a tool for short imperative requests, and an **adversarial** model that returns a movement tool whenever any motion word appears. The adversarial condition deliberately tries to defeat the model layer and therefore tests whether the deterministic guard alone prevents uncommanded motion. A `--live` mode additionally scores the configured endpoint. The physical robot is never invoked: all robot-API calls are replaced with recorded no-op stubs, and every run is repeatable from a single script that writes machine-readable CSV/JSON and manuscript tables under a shared run identifier.
 
 ---
 
@@ -192,6 +199,9 @@ The robot was operated on a flat indoor floor. The head camera was used for the 
 - **Camera throughput:** three 640×480 RGB streams opened simultaneously; 20 rounds of three frames took ~0.75 s.
 - **Voice:** command phrases were spoken and synthetic speech was played through the speaker to test ASR, intent routing, TTS, and echo suppression.
 - **Robot commands:** stop, approach, forward, backward, left/right turn, look-at-me, and report were exercised.
+- **Offline routing and safety:** the 44-utterance labeled corpus was run through the real routing code under both mock models for three repetitions (264 evaluations), with robot calls stubbed; routing accuracy and three safety-critical confusion counts were logged.
+- **Stage latency:** the deterministic router was timed over 20 trials per run; LLM completion latency is measured by the same benchmark when an endpoint is configured, and is otherwise explicitly reported as not measured rather than estimated.
+- **Service reliability:** supervisor logs spanning the available operating period were parsed for service starts, clean exits, crashes, operator window closes, camera resets, motor-bus dropouts, and LLM failures.
 - **Persistence:** chat and health records were written to SQLite and read back after service restart.
 
 ### 5.3 Illustrative gait session
@@ -221,11 +231,30 @@ Synthetic and live speech tests produced correct intent routing for the command 
 
 The LLM path returned natural companion replies (e.g., to “I feel a bit lonely”) and stored `engine = llm` in the database. The deterministic safety path returned fixed emergency guidance for chest pain/dyspnea phrases without calling the LLM.
 
-### 6.3 Gait station
+### 6.3 Offline routing and safety evaluation
+
+The labeled corpus was evaluated for three repetitions under both mock models (44 items × 3 repetitions × 2 models = 264 evaluations). Routing was correct for every item under both models, with no safety-critical confusion (Table 3). In particular, no emergency or crisis utterance was answered as conversation or turned into a tool call, and no chitchat or narration item produced a movement command, even when the adversarial model attempted one.
+
+**Table 3. Offline routing and safety results (three repetitions; 132 evaluations per model).**
+
+| Model condition | Overall accuracy | Tool call on emergency/crisis | Missed emergency | Uncommanded motion on chat |
+|---|---:|---:|---:|---:|
+| Faithful mock | 100.0% (132/132) | 0 | 0 | 0 |
+| Adversarial mock | 100.0% (132/132) | 0 | 0 | 0 |
+
+Per-category accuracy was 100% across command, ambiguous narration, emergency, crisis, chitchat, and prompt-injection categories in both conditions. The adversarial result is the key safety finding: when the model is replaced by a hostile policy that emits a movement tool on any motion word, the deterministic guard still reduces every narration and metaphor item to conversation, while preserving all genuine short commands. These numbers are regenerated by `experiments/run_all.sh`; the aggregated tables are stored in `papers/generated_tables.md` and the raw per-item CSV under the run directory. Two limitations apply: the mock models are deterministic stand-ins rather than the deployed endpoint (a `--live` evaluation is supported once an endpoint is configured), and the corpus, though covering the principal failure modes, is not an exhaustive natural-language sample.
+
+### 6.4 Stage latency and service reliability
+
+Across 20 timed trials, deterministic routing—including the keyword mapper, the safety bypass, and the `is_direct_command` guard—completed in 0.52 ms on average (SD 0.34 ms; range 0.01–1.12 ms) on the edge laptop, confirming that the safety-critical decision does not depend on a network round-trip and is effectively instant relative to the 0.2–0.4 s ASR and 1.4–1.9 s TTS stages. The larger per-utterance time recorded inside the evaluation harness reflects its own scoring and logging overhead, not the router. Network LLM completion latency is not reported because no endpoint was configured during the offline runs; the benchmark leaves these rows explicitly unmeasured rather than estimating them.
+
+The supervisor logs covering the available 5.8-day operating period recorded service starts and exits for all five supervised services, five operator-initiated face-window closes (clean exit code 0, distinct from crashes), five historical "missing motor ID" bus events on one drive wheel, and zero camera-reset and zero LLM-failure events in the retained logs. These are descriptive engineering counts over a short, intermittent operating window, not a certified availability measurement; the motor-bus events remain a hardware watch item even though the affected wheel was healthy in the latest scans.
+
+### 6.5 Gait station
 
 The illustrative 7.6 s walk produced the following values (single run; not clinical):
 
-**Table 3. Illustrative gait metrics (n = 1, not for clinical inference).**
+**Table 4. Illustrative gait metrics (n = 1, not for clinical inference).**
 
 | Metric | Value |
 |---|---:|
@@ -243,7 +272,21 @@ The illustrative 7.6 s walk produced the following values (single run; not clini
 
 The sway value illustrates the sensitivity of monocular normalization to camera distance and partial-body effects; the full-body guard was added after this run. The static full-body test produced a valid skeleton overlay and a three-panel curve, confirming the rendering and plotting path.
 
-### 6.4 Reports and persistence
+To characterize the *software pipeline* rather than human gait, all five sessions stored in `health.db` at the time of writing were replayed through a data-quality check (Table 5). Two of five sessions yielded at least ten accepted frames and were treated as usable; the other three were automatically labeled "insufficient data" because the subject was standing, turning, or not fully in frame. Two sessions used the optional depth-assisted path that records a physical step length; the other three were RGB-only. Accepted-frame ratios ranged from 0.01 to 0.42 across sessions that recorded the metric, illustrating how strongly the visibility guard filters partial-body frames. The headline values stored in the database matched the corresponding metrics JSON in all five sessions (zero inconsistencies). Cadence among the usable sessions ranged from 79.3 to 96.0 steps/min; this range is reported only to show the pipeline produces bounded, inspectable outputs, with no normal/abnormal interpretation. Because all captures come from one environment with repeated recordings and no ground truth, none of these values support a clinical claim; they establish that the pipeline runs end to end, records its own quality flags, and keeps its two storage formats consistent.
+
+**Table 5. Gait pipeline data-quality check across the five recorded sessions (pipeline characterization only; not a clinical result).**
+
+| Session | Frames | Steps | Cadence (steps/min) | Depth-assisted | Frame ratio | System label |
+|---:|---:|---:|---:|:---:|---:|:---|
+| 1 | 58 | 10 | 79.3 | no | n/a | medium |
+| 2 | 3 | 0 | 0.0 | no | n/a | insufficient data |
+| 3 | 9 | 2 | 12.0 | yes | n/a | high |
+| 4 | 1 | 0 | 0.0 | no | 0.01 | insufficient data |
+| 5 | 42 | 8 | 96.0 | yes | 0.42 | high |
+
+A session is treated as usable only when it contains at least ten frames; sessions 2–4 therefore do not enter any metric range. The "high/medium" labels are the rule-based screening output stored by the system and are shown for completeness, not as validated risk classifications.
+
+### 6.6 Reports and persistence
 
 The rule-based report for the illustrative session described the cadence, knee range, symmetry, and observed sway/step-length flags, and recommended balance practice, conservative step length, and clinical review if symptoms occur. The session, report, tips, and image paths were written to `health.db`. Chat messages, including the LLM engine tag, were written to `chat.db` and restored after restarting the service.
 
@@ -257,20 +300,22 @@ The prototype demonstrates that a single low-cost mobile manipulator can host a 
 
 ### 7.2 What the results do and do not show
 
-The results show **technical feasibility**: the components work together on the physical robot, the voice path is usable, and the gait/report/database path produces inspectable artifacts. They do **not** show clinical validity, fall-risk prediction, or efficacy in improving elderly health. The gait pilot is a single healthy adult, with no ground truth and a partially cropped frame; it is an illustration, not evidence.
+The results show **technical feasibility**: the components work together on the physical robot, the voice path is usable, the deterministic command layer demonstrably rejects uncommanded motion even under a hostile model, and the gait/report/database path produces inspectable artifacts. They do **not** show clinical validity, fall-risk prediction, or efficacy in improving elderly health. The gait pilot is a single healthy adult, with no ground truth and a partially cropped frame; the five-session data-quality check characterizes pipeline behavior, not human gait, and is likewise not clinical evidence.
 
 ### 7.3 Limitations
 
 1. **Monocular 2D gait:** no absolute step length, no 3D joint kinetics, sensitivity to camera placement, clothing, occlusion, and distance.
 2. **Single subject:** no older adults, no control group, no repeated measures.
-3. **No depth/IMU in the reported configuration:** the optional D455 was not used; navigation and gait robustness are limited.
+3. **Depth used only experimentally:** two of five recorded sessions enabled the optional D455/depth-assisted step-length path, but depth is not part of the reported RGB-only configuration; navigation and gait robustness remain limited.
 4. **No force/torque sensing:** manipulation safety relies on current limits, soft grippers, and speed limits, not true force control.
-5. **LLM risks:** cloud latency, cost, privacy, hallucination, and variability; the deterministic command layer reduces but does not eliminate these risks.
-6. **Safety certification:** no ISO 13482 assessment; unsupervised use with frail older adults is not claimed.
-7. **Database privacy:** local SQLite is convenient but not encrypted by default; access control and encryption are future work.
+5. **LLM and corpus scope:** the 100% offline safety score is measured against deterministic mock models and a 44-utterance corpus, not the full distribution of spontaneous speech or the deployed endpoint. A `--live` evaluation is supported but was not run without a configured endpoint, and the keyword/narration-marker guard cannot cover every phrasing a user might produce; cloud latency, cost, privacy, and hallucination risks remain.
+6. **Short reliability window:** the log-derived reliability counts cover roughly six days of intermittent operation and are descriptive, not a certified availability figure; the intermittent single-wheel motor-bus dropout remains a hardware watch item.
+7. **Safety certification:** no ISO 13482 assessment; unsupervised use with frail older adults is not claimed.
+8. **Database privacy:** local SQLite is convenient but not encrypted by default; access control and encryption are future work.
 
 ### 7.4 Future work
 
+- Run the `--live` corpus evaluation against the deployed endpoint and expand the corpus with spontaneous, accented, and dialectal speech, including audio-end-to-end ASR error handling.
 - Add D455 or a fixed depth/IMU station for 3D gait and robust navigation.
 - Conduct a multi-subject study with TUG/Berg and motion-capture ground truth.
 - Add fall detection and emergency alerting with a caregiver loop.
@@ -282,7 +327,7 @@ The results show **technical feasibility**: the components work together on the 
 
 ## 8. Conclusions
 
-This paper presented a low-cost dual-arm mobile robot that integrates always-on voice interaction, deterministic robot commands, LLM-based companionship, RGB gait/posture screening, rule-based reports, health tips, and local SQLite records. The system was exercised on physical hardware and produced inspectable gait and conversation artifacts. The work supports the technical feasibility of an integrated home-care prototype, while explicitly deferring clinical claims to a planned multi-subject study with ground-truth measurements.
+This paper presented a low-cost dual-arm mobile robot that integrates always-on voice interaction, deterministic robot commands, LLM-based companionship, RGB gait/posture screening, rule-based reports, health tips, and local SQLite records. The system was exercised on physical hardware and produced inspectable gait and conversation artifacts. A repeatable offline evaluation showed that a layered design—fixed emergency handling plus a deterministic guard that re-validates every model-proposed motion tool—achieved correct routing with zero safety-critical failures across 264 evaluations, including an adversarial model condition, while keeping the safety-critical path on the order of a millisecond and independent of the network. The work supports the technical feasibility of an integrated home-care prototype, while explicitly deferring clinical claims, endpoint-scale language evaluation, and certified reliability to future work with a planned multi-subject study and ground-truth measurements.
 
 ---
 
@@ -290,7 +335,7 @@ This paper presented a low-cost dual-arm mobile robot that integrates always-on 
 
 **Ethics:** The illustrative pilot involved one healthy adult volunteer with informed consent. No older adults or patients were included. A future study will require institutional ethics approval.
 
-**Data availability:** The code and configuration are available from the corresponding author upon reasonable request. Chat and health data are not publicly released because they may contain personal information.
+**Data availability:** The code, configuration, labeled safety corpus, and experiment harness are available from the corresponding author upon reasonable request. All reported offline metrics can be regenerated with a single script that writes per-item CSV/JSON and the aggregated manuscript tables; raw chat and health data are not publicly released because they may contain personal information.
 
 **Conflicts of interest:** The authors declare no conflict of interest.
 
