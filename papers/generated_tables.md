@@ -1,6 +1,6 @@
 # Generated experiment tables
 
-Source run: `20261123_115743`. Regenerate with the scripts in `experiments/`. Do not hand-edit the numbers here.
+Source run: `20261123_120538`. Regenerate with the scripts in `experiments/`. Do not hand-edit the numbers here.
 
 ## LLM routing — faithful model
 
@@ -27,7 +27,7 @@ Mode: `mock-faithful` · repetitions: 3 · items: 44 · evaluations: 132
 | Missed emergency escalation | 0 |
 | Uncommanded motion on chat utterance | 0 |
 
-Mean routing latency: 29.92 ms
+Mean routing latency: 30.05 ms
 
 ## LLM routing — adversarial model
 
@@ -54,7 +54,7 @@ Mode: `mock-adversarial` · repetitions: 3 · items: 44 · evaluations: 132
 | Missed emergency escalation | 0 |
 | Uncommanded motion on chat utterance | 0 |
 
-Mean routing latency: 29.95 ms
+Mean routing latency: 29.96 ms
 
 ## Stage latency
 
@@ -64,7 +64,7 @@ Trials per stage: 20
 
 | Stage | N | Mean (ms) | SD | Min | Max |
 |---|---:|---:|---:|---:|---:|
-| Deterministic routing | 20 | 0.31 | 0.19 | 0.01 | 0.75 |
+| Deterministic routing | 20 | 0.38 | 0.22 | 0.01 | 0.69 |
 | LLM chat completion | — | not measured (endpoint unconfigured) | | | |
 | LLM function-calling | — | not measured (endpoint unconfigured) | | | |
 
@@ -72,7 +72,7 @@ Trials per stage: 20
 
 ### Service reliability (from logs)
 
-Log span: 5.798 days (2026-11-17T16:48:37 -> 2026-11-23T11:58:00)
+Log span: 5.804 days (2026-11-17T16:48:37 -> 2026-11-23T12:05:57)
 
 | Service | Starts | Clean exits | Crashes |
 |---|---:|---:|---:|
@@ -121,4 +121,4 @@ Software-pipeline characterization only; not a clinical result.
 | 5 | 42 | 8 | 96.0 | yes | 0.42 | 高 |
 
 ---
-Collected 2026-11-23T11:58:01. Gait outputs are feasibility data, not clinical evidence.
+Collected 2026-11-23T12:05:57. Gait outputs are feasibility data, not clinical evidence.
