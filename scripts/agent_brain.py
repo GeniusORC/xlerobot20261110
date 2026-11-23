@@ -27,14 +27,14 @@ from datetime import datetime
 
 import requests
 
+import agent_settings
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHAT_DIR = os.path.join(ROOT, "data", "chat")
 os.makedirs(CHAT_DIR, exist_ok=True)
 CHAT_DB = os.path.join(CHAT_DIR, "chat.db")
 
-MAX_HISTORY = 10
 MAX_FACTS = 12
-LLM_TIMEOUT = 12
 LLM_LOCK = threading.Lock()
 LLM_STATE = {"ok": None, "latency_ms": None, "checked_at": None, "error": None}
 
@@ -196,30 +196,42 @@ def _facts_block() -> str:
 
 
 def system_prompt() -> str:
+    s = agent_settings.load()
+    parts = [locked_rules(s["name"])]
+    if s["prompt"].strip():
+        parts.append("补充要求（可编辑，但与固定规则冲突时以固定规则为准）：\n"
+                     + s["prompt"].strip())
+    parts.append(f"\n你记得的事实：\n{_facts_block()}\n")
+    return "\n".join(parts)
+
+
+def locked_rules(name: str) -> str:
+    """Safety and tool rules.  Not editable from the settings page on purpose."""
     return (
-        "你是“小乐”，一台面向老年人的居家陪伴机器人。\n"
-        "规则：\n"
-        "1. 先直接回答对方这句话，再补一句关心，不要绕圈子。\n"
-        "2. 不知道的事（天气、新闻、政策、药量、价格）就说“这个我不太清楚”，"
-        "绝不编造。\n"
-        "3. 下面是你记得的事实，用得上就用，别重复问已经知道的事。\n"
-        "4. 用户要机器人动，就调用工具；只是聊天不要调用工具。"
+        f"你是“{name}”，一台面向老年人的居家陪伴机器人。\n"
+        "固定规则（不可修改）：\n"
+        "1. 不知道的事（天气、新闻、政策、药量、价格）就说“这个我不太清楚”，绝不编造。\n"
+        "2. 用户要机器人动，就调用工具；只是聊天不要调用工具。"
         "用户在说身体不舒服、心情、家常、往事时，绝对不要调用移动工具。"
         "只有用户明确要求前进、后退、转向、停下、过来、看你或跟着你时才调用工具，"
         "即使你不确定机器人是否在线也要调用，不要只用文字敷衍。\n"
-        "5. 口语化，一般 2-3 句，不超过 120 个汉字。\n"
-        "6. 不做医学诊断、不开药。遇到胸痛、呼吸困难、跌倒、意识不清，"
+        "3. 不做医学诊断、不开药。遇到胸痛、呼吸困难、跌倒、意识不清，"
         "立刻建议坐下或躺下、叫家人、拨打 120。\n"
-        "7. 不要假装自己是真人。\n"
-        f"\n你记得的事实：\n{_facts_block()}\n"
+        "4. 不要假装自己是真人。"
     )
 
 
 # ---------------------------------------------------------------------------
 # LLM plumbing
 # ---------------------------------------------------------------------------
-def _post(messages, tools=None, temperature=0.5, max_tokens=300,
+def _post(messages, tools=None, temperature=None, max_tokens=None,
           response_format=None):
+    settings = agent_settings.load()
+    if temperature is None:
+        temperature = settings["temperature"]
+    if max_tokens is None:
+        max_tokens = settings["max_tokens"]
+    timeout = settings["timeout_s"]
     base = os.environ.get("LLM_BASE_URL", "").rstrip("/")
     key = os.environ.get("LLM_API_KEY", "")
     model = os.environ.get("LLM_MODEL", "")
@@ -242,7 +254,7 @@ def _post(messages, tools=None, temperature=0.5, max_tokens=300,
     started = time.monotonic()
     try:
         r = requests.post(f"{base}/chat/completions", headers=headers,
-                          json=body, timeout=LLM_TIMEOUT)
+                          json=body, timeout=timeout)
         r.raise_for_status()
         result = r.json()
         with LLM_LOCK:
@@ -265,7 +277,9 @@ def build_messages(text: str, history=None, context=None) -> list:
                        "回答与面前的人、距离、是否看得见相关的问题时以此为准；"
                        "看不到就说看不到，不要编。",
         })
-    for m in (history or [])[-MAX_HISTORY:]:
+    turns = agent_settings.load()["history_turns"]
+    recent = (history or [])[-turns:] if turns else []
+    for m in recent:
         role = m.get("role")
         if role in ("user", "assistant") and m.get("content"):
             msgs.append({"role": role, "content": m["content"]})

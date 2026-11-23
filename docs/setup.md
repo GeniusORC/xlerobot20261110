@@ -1354,6 +1354,23 @@ curl -s -X POST http://127.0.0.1:8086/window -H 'Content-Type: application/json'
 curl -s http://127.0.0.1:8086/window   # current state and monitor geometry
 ```
 
+### Agent prompt and model settings
+
+Open `http://127.0.0.1:8082/` and expand **智能体设置** to change the
+robot's name, additional prompt, temperature, output token limit, history
+message count, and request timeout. Save applies to the next conversation
+without restarting. **恢复默认** resets these settings. Overrides are stored
+in `data/agent/settings.json`; credentials stay in `~/.config/xlerobot/llm.env`.
+The existing safety and tool instructions remain in the assembled prompt;
+prompt instructions are not a substitute for the robot API's motion checks.
+
+Under **LLM 设置**, Volcengine Ark uses the OpenAI-compatible base URL
+`https://ark.cn-beijing.volces.com/api/v3`, an Ark API key, and a model ID or
+inference endpoint ID copied from the Ark console. A speech-service key is
+not interchangeable with an Ark chat key. Leave the key field blank to keep
+the current credential. Connection settings alone do not establish tool-call
+compatibility; verify that separately before using a new model for robot control.
+
 ### Head tracking
 
 `head_track.py` closes the loop on **pixels**, not motor angles:

@@ -37,6 +37,7 @@ import face_client as face
 import voice_web as vw
 from control_page import HTML as CONTROL_HTML
 import agent_brain
+import agent_settings
 from config_loader import CFG, project_path, service_url
 
 TRACE_LOCK = threading.Lock()
@@ -476,6 +477,25 @@ def api_llm_config():
     return jsonify({"ok": True})
 
 
+@app.route("/api/agent/settings", methods=["GET", "POST", "DELETE"])
+def api_agent_settings():
+    if request.method == "GET":
+        payload = agent_settings.describe()
+        payload["locked_rules"] = agent_brain.locked_rules(payload["values"]["name"])
+        payload["stored"] = agent_settings.PATH.exists()
+        return jsonify(payload)
+    if request.method == "DELETE":
+        return jsonify({"ok": True, "values": agent_settings.reset()})
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "需要 JSON 对象"}), 400
+    try:
+        values = agent_settings.save(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "values": values})
+
+
 HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>XLeRobot 养老陪伴</title>
 <style>
@@ -500,6 +520,11 @@ small{color:#888}
 .camwrap{display:none}.camwrap.on{display:block}
 .camsw{font-size:13px;padding:8px 11px;margin:2px}
 .settings{margin-top:10px;padding-top:8px;border-top:1px solid #444}
+textarea{width:100%;box-sizing:border-box;font-size:15px;line-height:1.5;padding:10px;border-radius:9px;border:0;color:#111;font-family:inherit;resize:vertical}
+label{font-size:13px;color:#bbb;display:flex;flex-direction:column;gap:4px;flex:1;min-width:0}
+label input{width:100%;box-sizing:border-box}
+.rulebox{white-space:pre-wrap;font-size:12px;color:#9ab;background:#141416;padding:10px;border-radius:8px;margin:6px 0 0;max-height:180px;overflow:auto}
+.hint{font-size:12px;color:#888;margin-top:6px}
 </style></head><body>
 <h1>XLeRobot 养老陪伴 <small>· 自动语音</small>
   <a href="/control" style="font-size:13px;font-weight:400;color:#7ab;margin-left:10px">控制台 →</a></h1>
@@ -527,6 +552,26 @@ small{color:#888}
     <details class="settings"><summary>LLM 设置</summary>
       <div class="row"><input id="llmBase" placeholder="https://api.example.com/v1"><input id="llmModel" placeholder="模型名"></div>
       <div class="row"><input id="llmKey" type="password" placeholder="API key（留空保持不变）"><button onclick="saveLlm()">保存</button></div>
+    </details>
+    <details class="settings"><summary>智能体设置：提示词 / 温度 / 记忆</summary>
+      <div class="row">
+        <label>名字<input id="agentName" maxlength="24" placeholder="小乐"></label>
+        <label>温度 0–1.5<input id="agentTemp" type="number" min="0" max="1.5" step="0.1"></label>
+      </div>
+      <div class="row">
+        <label>回复上限 tokens<input id="agentTokens" type="number" min="50" max="1200" step="10"></label>
+        <label>历史消息条数<input id="agentHist" type="number" min="0" max="20" step="1"></label>
+        <label>超时 s<input id="agentTimeout" type="number" min="3" max="60" step="1"></label>
+      </div>
+      <label style="margin-top:10px">可编辑提示词（附加在固定规则之后）
+        <textarea id="agentPrompt" rows="6" maxlength="4000"></textarea></label>
+      <div class="row">
+        <button onclick="saveAgent()">保存</button>
+        <button onclick="resetAgent()">恢复默认</button>
+        <span id="agentMsg" class="hint"></span>
+      </div>
+      <details><summary>固定规则（安全约束，不可修改）</summary><pre class="rulebox" id="lockedRules"></pre></details>
+      <div class="hint">保存在 data/agent/settings.json，下一条对话生效，不需要重启。</div>
     </details>
   </div>
   <div class="card">
@@ -609,6 +654,40 @@ async function saveLlm(){
   document.getElementById('llmStatus').textContent=result.ok?'LLM 配置已保存':'保存失败: '+(result.error||'未知错误');
   pollStatus();
 }
+async function loadAgent(){
+  const r=await fetch('/api/agent/settings');
+  if(!r.ok) throw new Error('无法加载设置');
+  const j=await r.json(), v=j.values;
+  for(const [id,key] of Object.entries({agentName:'name',agentTemp:'temperature',agentTokens:'max_tokens',agentHist:'history_turns',agentTimeout:'timeout_s',agentPrompt:'prompt'})){
+    document.getElementById(id).value=v[key];
+  }
+  document.getElementById('lockedRules').textContent=j.locked_rules;
+}
+async function saveAgent(){
+  const msg=document.getElementById('agentMsg');
+  try{
+    const body={name:document.getElementById('agentName').value,prompt:document.getElementById('agentPrompt').value};
+    for(const [id,key] of Object.entries({agentTemp:'temperature',agentTokens:'max_tokens',agentHist:'history_turns',agentTimeout:'timeout_s'})){
+      const raw=document.getElementById(id).value;
+      if(!raw.trim()) throw new Error('请填写所有数字参数');
+      body[key]=Number(raw);
+    }
+    const r=await fetch('/api/agent/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error||'保存失败');
+    await loadAgent(); msg.textContent='已保存，下一条对话生效';
+  }catch(e){msg.textContent=e.message;}
+}
+async function resetAgent(){
+  if(!confirm('恢复默认提示词和参数？')) return;
+  const msg=document.getElementById('agentMsg');
+  try{
+    const r=await fetch('/api/agent/settings',{method:'DELETE'});
+    if(!r.ok) throw new Error('恢复失败');
+    await loadAgent(); msg.textContent='已恢复默认';
+  }catch(e){msg.textContent=e.message;}
+}
+loadAgent().catch(e=>{document.getElementById('agentMsg').textContent=e.message;});
 setInterval(pollMsgs,700);
 setInterval(pollStatus,2000);
 pollMsgs(); pollStatus();
@@ -632,7 +711,8 @@ def main():
     vw.load_models()
     init_chat_db()
     if message_count() == 0:
-        add_message("bot", "您好，我是小乐，您的居家陪伴机器人。今天感觉怎么样？")
+        name = agent_settings.load()["name"]
+        add_message("bot", f"您好，我是{name}，您的居家陪伴机器人。今天感觉怎么样？")
     print(f"auto voice web on http://{args.host}:{args.port}", flush=True)
     print("LLM configured:", bool(os.environ.get("LLM_BASE_URL") and os.environ.get("LLM_MODEL")), flush=True)
     if not args.no_listen:

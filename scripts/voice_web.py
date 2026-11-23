@@ -45,7 +45,7 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 VAD = None
 ASR = None
 CHAT_HISTORY = []
-MAX_HISTORY = 12
+MAX_HISTORY = 20
 
 # Ending follow is handled in code, like "停下": a chat answer would leave the
 # base following while the robot claims it stopped.
